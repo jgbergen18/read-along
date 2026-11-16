@@ -34,6 +34,7 @@ const S = {
   hl: [], sections: new Map(), coverUrl: null,
   saveTimer: null, syncTimer: null, tickTimer: null,
   sleep: null,                 // { until: ms } or { chapterEnd: seconds }
+  audioReady: false,           // the audio is loaded and at the book's place (until then, the place isn't saved)
 };
 
 const fmt = (t) => {
@@ -57,9 +58,15 @@ const chapterLabel = (t) => {
 };
 
 let toastTimer = null;
-function toast(msg, ms = 3200) {
+function toast(msg, ms = 3200, action) {
   const el = $('#toast');
   el.textContent = msg; el.hidden = false;
+  if (action) {                                   // optional button, e.g. { label: 'Go there', run() {} }
+    const b = document.createElement('button');
+    b.className = 'toast-act'; b.textContent = action.label;
+    b.addEventListener('click', () => { el.hidden = true; action.run(); });
+    el.append(' ', b);
+  }
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { el.hidden = true; }, ms);
 }
@@ -116,6 +123,7 @@ async function loadCover(b, el) {
 // ================================================================ open / close
 async function openBook(meta) {
   S.meta = meta;
+  S.audioReady = false;
   S.follow = true; S.lastW = -1; S.loc = null; S.hl = []; S.sections = new Map(); S.sleep = null;
   updateSleepUI();
   $('#library').hidden = true;
@@ -131,7 +139,13 @@ async function openBook(meta) {
   if (remote && (remote.updated || 0) > (pos.updated || 0) + 1000) {
     pos = Object.assign(pos, { time: remote.time, cfi: remote.cfi || pos.cfi, updated: remote.updated });
     if (remote.device && remote.device !== deviceName() && remote.time > 5) toast(`Picking up where you left off on ${remote.device}.`);
+  } else if (pos.time != null && pos.updated && (!remote || Math.abs((remote.time || 0) - pos.time) >= 2)) {
+    // this device has a newer place the others never got (e.g. closed before it was sent): send it now,
+    // with the time it was really reached, so it never beats something newer from another device
+    Shared.send([{ op: 'position', time: pos.time, cfi: pos.cfi || null, dur: pos.dur || null, chapter: pos.chapter || null,
+      device: deviceName(), updated: pos.updated }]);
   }
+  Shared.resetPush(pos);
   store.set('pos:' + meta.id, Object.assign(pos, { opened: Date.now() }));
 
   try {
@@ -171,6 +185,7 @@ async function openBook(meta) {
     setupMediaSession();
     if (pos.time != null) audio.currentTime = pos.time;
   }
+  S.audioReady = true;
 
   if (S.sync && meta.audio) {
     await S.rendition.display();
@@ -200,18 +215,23 @@ function closeBook() {
   clearInterval(S.saveTimer); clearInterval(S.syncTimer); stopTick();
   S.sleep = null; audio.volume = 1;
   try { S.book.destroy(); } catch { /* ignore */ }
-  S.book = S.rendition = S.sync = null; S.at = S.aw = null;
+  S.book = S.rendition = S.sync = null; S.at = S.aw = null; S.audioReady = false;
   $('#viewer').innerHTML = '';
   closePanels();
 }
 
 function savePos() {
   if (!S.meta || !S.book) return;
+  // while the audio is still loading (or reloading) its time is 0, not the book's place: save nothing
+  if (S.meta.audio && !(S.audioReady && audio.readyState >= 1)) return;
   const prev = store.get('pos:' + S.meta.id) || {};
+  const time = audio.src ? audio.currentTime : null;
+  // "updated" = when the place last changed (not just "still open"), so another device's newer place wins
+  const moved = time != null && (prev.time == null || Math.abs(time - prev.time) >= 1 || !prev.updated);
   store.set('pos:' + S.meta.id, Object.assign(prev, {
-    time: audio.src ? audio.currentTime : null, dur: audio.duration || prev.dur || null,
+    time: time != null ? time : prev.time, dur: audio.duration || prev.dur || null,
     cfi: S.loc && S.loc.start ? S.loc.start.cfi : prev.cfi, chapter: currentChapter(audio.currentTime).title || prev.chapter,
-    opened: Date.now(), updated: Date.now(),
+    opened: Date.now(), ...(moved ? { updated: Date.now() } : {}),
   }));
   Shared.pushPosition(audio.paused);
 }
@@ -827,7 +847,7 @@ function onKey(e) {
   if (e.target && /^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName) && e.key !== 'Escape') return;
   if (e.key === 'Escape') {
     const modal = $$('.modal').find((m) => !m.hidden && m.id !== 'offline');
-    if (modal) { modal.hidden = true; return; }
+    if (modal) { if (modal.id === 'sync-dialog') SyncUI.close(); else modal.hidden = true; return; }
     if (!$('#sel-menu').hidden) { Notes.hideMenu(); return; }
     if ($$('.panel').some((p) => !p.hidden)) { closePanels(); return; }
     if (S.book) showLibrary();
@@ -879,7 +899,19 @@ $('#opt-lan').addEventListener('change', (e) => setPhone({ lan: e.target.checked
 $('#opt-startup').addEventListener('change', (e) => setPhone({ lan: true, startup: e.target.checked }));
 $('#ip-choice').addEventListener('change', (e) => setPhone({ lan: true, ip: e.target.value }));
 $('#btn-newkey').addEventListener('click', () => { if (confirm('Make a new key? Phones you already paired will need to scan the new code.')) setPhone({ lan: true, newKey: true }); });
-$('#btn-retry').addEventListener('click', () => { $('#offline').hidden = true; if (S.book) { loadSync(true); audio.load(); } else showLibrary(); });
+$('#btn-retry').addEventListener('click', () => { $('#offline').hidden = true; if (S.book) { loadSync(true); reloadAudio(); } else showLibrary(); });
+// reload the audio (e.g. after the PC was out of reach) without losing the place: a reload starts at 0
+function reloadAudio() {
+  const id = S.meta.id;
+  const t = S.audioReady ? audio.currentTime : ((store.get('pos:' + id) || {}).time || 0);
+  S.audioReady = false;
+  audio.addEventListener('loadedmetadata', () => {
+    if (!S.meta || S.meta.id !== id) return;          // another book was opened meanwhile
+    if (t) audio.currentTime = t;
+    S.audioReady = true;
+  }, { once: true });
+  audio.load();
+}
 
 $('#speed').addEventListener('change', (e) => { settings.rate = +e.target.value; audio.playbackRate = settings.rate; saveSettings(); });
 $('#font-dn').addEventListener('click', () => { settings.font = Math.max(70, settings.font - 10); saveSettings(); applySettings(); });
@@ -913,7 +945,10 @@ audio.addEventListener('error', () => { if (audio.getAttribute('src') && !audio.
 window.addEventListener('beforeunload', savePos);
 let resizeTimer = null;
 window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { if (S.book) { S.lastW = -1; followAudio(true); Notes.renderAll(); } }, 250); });
-document.addEventListener('visibilitychange', () => { if (document.hidden) savePos(); else if (S.book) { S.lastW = -1; followAudio(true); } });
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) savePos();
+  else if (S.book) { S.lastW = -1; followAudio(true); Shared.refresh(); }     // and see if another device got further
+});
 
 // heartbeat: lets the background server know a reader window is still open
 setInterval(() => { fetch('api/ping', { cache: 'no-store' }).then(() => { $('#offline').hidden = true; }).catch(() => {}); }, 20000);

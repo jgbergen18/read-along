@@ -19,6 +19,7 @@
   <script src="reader/vendor/jszip.min.js"></script>
   <script src="reader/vendor/epub.min.js"></script>
   <script src="reader/vendor/qrcode.min.js"></script>
+  <script src="reader/vendor/jsqr.min.js"></script>
 </head>
 <body>
   <svg width="0" height="0" style="position:absolute" aria-hidden="true">
@@ -41,6 +42,7 @@
       <symbol id="i-pen" viewBox="0 0 24 24"><path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M13.5 6.5l4 4"/></symbol>
       <symbol id="i-trash" viewBox="0 0 24 24"><path d="M5 7h14M10 7V4h4v3M7 7l1 13h8l1-13"/></symbol>
       <symbol id="i-flame" viewBox="0 0 24 24"><path d="M12 21c-4 0-6.5-2.6-6.5-6.2 0-3.6 3-5.6 3.6-9.3 2.3 1.3 3.6 3.4 3.4 5.6 1-.6 1.8-1.7 2-3 2 1.8 3.5 4.1 3.5 6.7 0 3.6-2.5 6.2-6 6.2z"/></symbol>
+      <symbol id="i-sync" viewBox="0 0 24 24"><path d="M20 7a8.5 8.5 0 0 0-15 2"/><path d="M20 3v4h-4"/><path d="M4 17a8.5 8.5 0 0 0 15-2"/><path d="M4 21v-4h4"/></symbol>
       <symbol id="i-aa" viewBox="0 0 24 24"><text x="2.5" y="17.5" font-size="14" font-family="Georgia, serif" stroke="none" fill="currentColor">Aa</text></symbol>
     </defs>
   </svg>
@@ -53,6 +55,7 @@
         <p class="muted" id="lib-sub">Read along while the audiobook plays.</p>
       </div>
       <div class="head-actions">
+        <button id="btn-sync" class="pill-btn" hidden><svg><use href="#i-sync"/></svg><span>Sync</span></button>
         <button id="btn-add" class="pill-btn" hidden><svg><use href="#i-plus"/></svg><span>Add book</span></button>
         <button id="btn-phone" class="pill-btn" hidden><svg><use href="#i-phone"/></svg><span>Use on phone</span></button>
       </div>
@@ -313,6 +316,62 @@
     </div>
   </div>
 
+  <div id="sync-dialog" class="modal" hidden>
+    <div class="modal-card" role="dialog" aria-labelledby="sync-h">
+      <div class="panel-head"><strong id="sync-h">Sync between your devices</strong><button class="icon" id="sync-close" aria-label="Close"><svg><use href="#i-close"/></svg></button></div>
+      <div class="modal-body">
+        <p class="muted">Keeps your place, bookmarks, highlights and notes the same on the laptop and the offline phone app. Only this reading data is synced, through a private repository on your GitHub account, never the books.</p>
+
+        <div id="sync-laptop">
+          <p class="sync-status"><b>Status:</b> <span id="sync-laptop-status"></span></p>
+          <div id="sync-laptop-setup">
+            <ol class="steps">
+              <li><a href="https://github.com/settings/personal-access-tokens/new?name=Read-Along+sync&description=Lets+Read-Along+sync+reading+progress+(read-along-sync+repository+only)&expires_in=none&contents=write" target="_blank" rel="noopener"><b>Open GitHub's key page</b></a>. The name, expiry and permission are filled in for you. Under <b>Repository access</b>, choose <b>Only select repositories</b> and pick <b id="sync-repo-name">read-along-sync</b>. Then click <b>Generate token</b> and copy the key.</li>
+              <li>Paste the key here:
+                <div class="token-row"><input id="sync-token" type="password" placeholder="github_pat_…" autocomplete="off" spellcheck="false"><button id="sync-connect" class="toggle on">Connect</button></div>
+              </li>
+            </ol>
+          </div>
+          <div id="sync-laptop-on" hidden>
+            <button id="sync-show-code" class="toggle on">Show code for your phone</button>
+            <div id="sync-qr-wrap" class="qr-wrap" hidden>
+              <div id="sync-qr" class="qr"></div>
+              <ol class="steps">
+                <li>On your iPhone, open <b>Read-Along from the home screen</b>.</li>
+                <li>Tap <b>Sync → Scan code</b> and point the camera at this code.</li>
+              </ol>
+            </div>
+            <p class="muted tiny">The code contains your sync key, so only show it to your own phone.</p>
+          </div>
+        </div>
+
+        <div id="sync-phone" hidden>
+          <p class="sync-status"><b>Status:</b> <span id="sync-phone-status"></span></p>
+          <div id="sync-phone-setup">
+            <p>On the laptop, open Read-Along → <b>Sync</b> → <b>Show code for your phone</b>. Then:</p>
+            <button id="sync-scan" class="toggle on">Scan code</button>
+            <div id="sync-scan-box" class="scan-box" hidden>
+              <video id="sync-video" playsinline muted></video>
+              <button id="sync-scan-stop" class="ghost small">Cancel</button>
+            </div>
+            <details class="paste">
+              <summary>Can't use the camera?</summary>
+              <textarea id="sync-paste" rows="3" placeholder="Paste the code (it starts with RA-SYNC:)"></textarea>
+              <button id="sync-paste-go" class="ghost small">Connect</button>
+            </details>
+          </div>
+          <div id="sync-phone-on" hidden><p>This phone is connected. Progress syncs whenever it has internet.</p></div>
+        </div>
+
+        <div id="sync-actions" class="row-start" hidden>
+          <button id="sync-now" class="ghost">Sync now</button>
+          <button id="sync-off" class="ghost danger">Turn off sync</button>
+        </div>
+        <p id="sync-error" class="error" hidden></p>
+      </div>
+    </div>
+  </div>
+
   <div id="keys-dialog" class="modal" hidden>
     <div class="modal-card small" role="dialog" aria-labelledby="keys-h">
       <div class="panel-head"><strong id="keys-h">Keyboard shortcuts</strong><button class="icon" data-close-modal aria-label="Close"><svg><use href="#i-close"/></svg></button></div>
@@ -342,5 +401,6 @@
   <script src="reader/notes.js"></script>
   <script src="reader/library-ui.js"></script>
   <script src="reader/offline.js"></script>
+  <script src="reader/sync.js"></script>
 </body>
 </html>

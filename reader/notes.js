@@ -13,11 +13,15 @@ const deviceName = () => (isLocal ? 'your PC'
     : /Android/.test(navigator.userAgent) ? 'your phone' : 'another device');
 const today = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+// shorten text without cutting an emoji (or other 2-part character) in half
+const cut = (s, n) => { s = String(s); if (s.length <= n) return s; const c = s.charCodeAt(n - 1); return s.slice(0, c >= 0xd800 && c <= 0xdbff ? n - 1 : n); };
 const esc = (t) => String(t == null ? '' : t).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
 // ================================================================ shared state
 const Shared = {
   state: null, lastPushT: -1, lastPushAt: 0, listenAcc: 0, lastTick: 0,
+  lastMoveAt: 0,          // when this device last moved the listening position (its own clock)
+  offeredAt: 0,           // the other device's position we last offered to jump to
 
   async load(id) {
     try { this.state = await (await api('api/state/' + encodeURIComponent(id))).json(); } catch { this.state = null; }
@@ -33,15 +37,52 @@ const Shared = {
       return this.state;
     } catch { return null; }
   },
+  // a book was opened at pos: that place is not news, so it is not sent again until the listening moves
+  // (re-sending an unchanged place as "newest" would override progress made on another device)
+  resetPush(pos) {
+    this.lastPushT = pos && pos.time != null ? pos.time : -1;
+    this.lastPushAt = 0;
+    this.lastMoveAt = (pos && pos.updated) || 0;
+    this.offeredAt = 0;
+    this.unsent = null;
+  },
+  unsent: null,           // a place that could not be sent (no connection): sent again later, unchanged
   pushPosition(force) {
-    if (!S.meta || !audio.getAttribute('src')) return;
+    if (!S.meta || !audio.getAttribute('src') || !S.audioReady || audio.readyState < 1) return;
     const t = audio.currentTime, now = Date.now();
-    if (!force && (now - this.lastPushAt < 15000 || Math.abs(t - this.lastPushT) < 2)) return;
-    this.lastPushAt = now; this.lastPushT = t;
-    const ops = [{ op: 'position', time: t, cfi: S.loc && S.loc.start ? S.loc.start.cfi : null, dur: audio.duration || null,
-      chapter: currentChapter(t).title || null, device: deviceName(), updated: now }];
-    if (this.listenAcc >= 1) { ops.push({ op: 'listened', date: today(), seconds: Math.round(this.listenAcc) }); this.listenAcc = 0; }
-    this.send(ops);
+    if (!force && now - this.lastPushAt < 15000) return;
+    const ops = [];
+    let posOp = null;
+    if (Math.abs(t - this.lastPushT) >= 2) {
+      posOp = { op: 'position', time: t, cfi: S.loc && S.loc.start ? S.loc.start.cfi : null, dur: audio.duration || null,
+        chapter: currentChapter(t).title || null, device: deviceName(), updated: now };
+      this.lastPushT = t; this.lastMoveAt = now;
+    } else if (this.unsent) posOp = this.unsent;   // keeps its own time stamp, so it never beats newer news
+    if (posOp) ops.push(posOp);
+    const secs = this.listenAcc >= 1 ? Math.round(this.listenAcc) : 0;
+    if (secs) { ops.push({ op: 'listened', date: today(), seconds: secs }); this.listenAcc = 0; }
+    if (!ops.length) return;
+    this.lastPushAt = now;
+    const book = S.meta.id;
+    this.send(ops).then((r) => {
+      if (r) { if (posOp) this.unsent = null; return; }
+      if (!S.meta || S.meta.id !== book) return;           // another book by now
+      if (posOp && (!this.unsent || (this.unsent.updated || 0) <= posOp.updated)) this.unsent = posOp;
+      this.listenAcc += secs;
+    });
+  },
+  // another device got further while this one sat paused: offer to go there (never jump by itself)
+  checkAhead() {
+    const r = this.state && this.state.position;
+    if (!r || !S.book || !audio.paused || !r.device || r.device === deviceName() || r.time == null) return;
+    const at = r.updated || 0;
+    if (at <= this.lastMoveAt + 1000 || at <= this.offeredAt || Math.abs(r.time - audio.currentTime) < 30) return;
+    this.offeredAt = at;
+    const ch = chapterLabel(currentChapter(r.time).title || '');
+    const what = r.time > audio.currentTime ? 'You got further on' : r.time < 5 ? 'You started over on' : 'You went back to an earlier place on';
+    toast(`${what} ${r.device}${ch ? ` (${ch})` : ''}.`, 15000, {
+      label: 'Go there', run: () => { audio.currentTime = r.time; setFollow(true); this.lastPushT = r.time; this.lastMoveAt = at; },
+    });
   },
   tickListen() {                                   // wall-clock time spent listening
     const now = performance.now();
@@ -65,7 +106,7 @@ const Notes = {
     this.renderAll();
   },
 
-  list(kind) { return (Shared.state && Shared.state[kind]) || []; },
+  list(kind) { return ((Shared.state && Shared.state[kind]) || []).filter((x) => !x.deleted); },   // hide deleted ones
 
   // ---- drawing the reader's own highlights
   boxes: [],
@@ -127,7 +168,7 @@ const Notes = {
     if (!this.sel) return;
     const { cfiRange, text } = this.sel;
     const where = await this.place(cfiRange);
-    const h = { id: uid(), cfi: cfiRange, text: text.slice(0, 2000), color, note: '', created: Date.now(), ...where };
+    const h = { id: uid(), cfi: cfiRange, text: cut(text, 2000), color, note: '', created: Date.now(), ...where };
     this.clearSelection();
     await Shared.send([{ op: 'add', kind: 'highlights', item: h }]);
     this.draw(h);
@@ -199,7 +240,7 @@ const Notes = {
       let text = '';
       try { text = (await S.book.getRange(S.loc.start.cfi + '')).toString(); } catch { /* ignore */ }
       if (!text && where.word != null) text = await snippetAt(where.word, 18);
-      await Shared.send([{ op: 'add', kind: 'bookmarks', item: { id: uid(), cfi, text: text.slice(0, 300), created: Date.now(), ...where } }]);
+      await Shared.send([{ op: 'add', kind: 'bookmarks', item: { id: uid(), cfi, text: cut(text, 300), created: Date.now(), ...where } }]);
       toast('Bookmarked.', 1400);
     }
     this.updateBookmarkBtn();
@@ -432,8 +473,20 @@ setInterval(async () => {
   if (!S.book || !S.meta || document.hidden) return;
   const before = JSON.stringify([Shared.state && Shared.state.highlights, Shared.state && Shared.state.bookmarks]);
   await Shared.load(S.meta.id);
+  Shared.afterLoad(before);
+}, 60000);
+// fresh reading data arrived (from this or another device): redraw notes, offer the newer place
+Shared.afterLoad = function (before) {
+  if (!S.book) return;
   if (JSON.stringify([Shared.state && Shared.state.highlights, Shared.state && Shared.state.bookmarks]) !== before) {
     Notes.renderAll(); Notes.updateBookmarkBtn();
     if (!$('#notes-panel').hidden) Notes.renderPanel();
   }
-}, 60000);
+  Shared.checkAhead();
+};
+Shared.refresh = async function () {
+  if (!S.book || !S.meta) return;
+  const before = JSON.stringify([Shared.state && Shared.state.highlights, Shared.state && Shared.state.bookmarks]);
+  await Shared.load(S.meta.id);
+  Shared.afterLoad(before);
+};

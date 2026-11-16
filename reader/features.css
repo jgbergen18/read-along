@@ -140,3 +140,16 @@ kbd { font: 600 12.5px ui-monospace, Consolas, monospace; background: var(--hove
 @keyframes indet { from { left: -30%; } to { left: 100%; } }
 #pack-choose { margin: 8px 0 4px; }
 a.ghost { text-decoration: none; color: inherit; }
+
+/* sync */
+.sync-status { margin: 4px 0 12px; }
+.token-row { display: flex; gap: 8px; margin-top: 8px; }
+.token-row input { flex: 1; min-width: 0; height: 36px; border-radius: 9px; border: 1px solid var(--line); background: var(--bg); padding: 0 10px; font-family: ui-monospace, Consolas, monospace; }
+.row-start { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+#sync-qr-wrap { margin-top: 14px; }
+.scan-box { margin-top: 12px; display: grid; gap: 8px; justify-items: center; }
+.scan-box video { width: 100%; max-width: 360px; aspect-ratio: 1; object-fit: cover; border-radius: 12px; background: #000; }
+details.paste { margin-top: 14px; }
+details.paste summary { cursor: pointer; color: var(--muted); }
+details.paste textarea { width: 100%; margin: 8px 0; border-radius: 10px; border: 1px solid var(--line); background: var(--bg); padding: 8px; font: 12px ui-monospace, Consolas, monospace; }
+#sync-dialog .steps ul { margin: 6px 0 0; padding-left: 18px; }

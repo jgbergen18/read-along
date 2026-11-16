@@ -19,15 +19,20 @@ const LocalDB = {
   open() {
     if (!this.db) {
       this.db = new Promise((res, rej) => {
-        const r = indexedDB.open('read-along', 2);
+        const r = indexedDB.open('read-along', 3);
         r.onupgradeneeded = () => {
           const d = r.result;
-          for (const [name, opts] of [['books', { keyPath: 'id' }], ['files', undefined], ['state', undefined], ['chunks', undefined]]) {
+          for (const [name, opts] of [['books', { keyPath: 'id' }], ['files', undefined], ['state', undefined], ['chunks', undefined], ['meta', undefined]]) {
             if (!d.objectStoreNames.contains(name)) d.createObjectStore(name, opts);
           }
         };
-        r.onsuccess = () => res(r.result);
+        r.onsuccess = () => {
+          const d = r.result;
+          d.onversionchange = () => { d.close(); this.db = null; };   // let a newer version of the app upgrade
+          res(d);
+        };
         r.onerror = () => rej(r.error);
+        r.onblocked = () => { try { toast('Close Read-Along in your other tabs to finish updating it.', 8000); } catch { /* ignore */ } };
       });
     }
     return this.db;
@@ -52,6 +57,27 @@ const LocalDB = {
 // ---------------------------------------------------------------- the local "server"
 const Local = {
   urls: {},          // id -> { epub, audio, sync } object URLs for the stored files
+  locks: {},         // id -> promise: one change to a book's reading data at a time
+  replicaId: null,
+
+  // a stable id for this phone's copy of the reading data (listening time is kept per device)
+  async replica() {
+    if (!this.replicaId) {
+      let id = null;
+      try { id = await LocalDB.get('meta', 'replica'); } catch { /* ignore */ }
+      if (!id) { id = 'phone-' + Math.random().toString(36).slice(2, 10); try { await LocalDB.put('meta', id, 'replica'); } catch { /* ignore */ } }
+      this.replicaId = id;
+    }
+    return this.replicaId;
+  },
+
+  withLock(id, fn) {
+    const run = (this.locks[id] || Promise.resolve()).then(fn, fn);
+    this.locks[id] = run.catch(() => {});
+    return run;
+  },
+
+  async saveRaw(id, st) { await LocalDB.put('state', st, id); },
 
   async fileUrls(id, book) {
     if (!this.urls[id]) {
@@ -85,51 +111,76 @@ const Local = {
       const st = await this.state(b.id);
       out.push({ ...b, folder: b.id, epub: u.epub, audio: u.audio, sync: u.sync, aligned: true,
         syncInfo: { complete: true, mode: b.syncMode || 'dense', duration: b.duration },
-        position: st.position, finished: st.finished, bookmarks: st.bookmarks.length, highlights: st.highlights.length });
+        position: st.position, finished: st.finished,
+        bookmarks: st.bookmarks.filter((x) => !x.deleted).length, highlights: st.highlights.filter((x) => !x.deleted).length });
     }
     return out;
   },
 
   async state(id) {
-    const st = (await LocalDB.get('state', id)) || {};
-    return { position: null, bookmarks: [], highlights: [], listened: {}, finished: null, ...st };
+    const st = SyncCore.normalize((await LocalDB.get('state', id)) || {}, await this.replica());
+    st.id = id;
+    return st;
   },
 
-  // same rules as library.apply_ops on the laptop
-  async apply(id, ops) {
-    const st = await this.state(id);
-    for (const op of Array.isArray(ops) ? ops : [ops]) {
-      const k = op.op;
-      if (k === 'position') {
-        const pos = { time: op.time, cfi: op.cfi, dur: op.dur, chapter: op.chapter, device: op.device, updated: op.updated };
-        if (!st.position || (pos.updated || 0) >= (st.position.updated || 0)) st.position = pos;
-        if (op.dur && op.time >= op.dur - 90 && !st.finished) st.finished = Date.now();
-      } else if ((k === 'add' || k === 'update') && (op.kind === 'bookmarks' || op.kind === 'highlights')) {
-        const item = op.item || {};
-        if (!item.id) continue;
-        const list = st[op.kind];
-        const i = list.findIndex((x) => x.id === item.id);
-        if (i < 0) list.push(item); else list[i] = { ...list[i], ...item };
-      } else if (k === 'remove' && (op.kind === 'bookmarks' || op.kind === 'highlights')) {
-        st[op.kind] = st[op.kind].filter((x) => x.id !== op.id);
-      } else if (k === 'listened') {
-        const day = String(op.date).slice(0, 10);
-        st.listened[day] = Math.round(((st.listened[day] || 0) + Math.max(0, Math.min(+op.seconds || 0, 3600))) * 10) / 10;
-      } else if (k === 'finished') {
-        st.finished = op.value ? Date.now() : null;
-      } else if (k === 'restart') {
-        st.position = { time: 0, cfi: null, updated: Date.now(), device: op.device };
-        st.finished = null;
+  // changes being saved right now (a sync pass waits for them, so a change made as the app is left is sent)
+  pending: new Set(),
+  apply(id, ops) {
+    const p = this.applyNow(id, ops);
+    this.pending.add(p);
+    const done = () => this.pending.delete(p);
+    p.then(done, done);
+    return p;
+  },
+
+  // same rules as library.apply_ops on the laptop (every change is time-stamped so it can be merged
+  // with the other devices; deletions are kept as bare "tombstones")
+  async applyNow(id, ops) {
+    const replica = await this.replica();
+    const st = await this.withLock(id, async () => {
+      const st = await this.state(id);
+      const now = Date.now();
+      for (const op of Array.isArray(ops) ? ops : [ops]) {
+        const k = op.op;
+        if (k === 'position') {
+          const pos = { time: op.time, cfi: op.cfi, dur: op.dur, chapter: op.chapter, device: op.device, updated: op.updated };
+          if (!st.position || (pos.updated || 0) >= (st.position.updated || 0)) st.position = pos;
+          if (op.dur && op.time >= op.dur - 90 && !st.finished) { st.finished = now; st.finishedUpdated = now; }
+        } else if ((k === 'add' || k === 'update') && (op.kind === 'bookmarks' || op.kind === 'highlights')) {
+          const item = op.item || {};
+          if (!item.id) continue;
+          const list = st[op.kind];
+          const i = list.findIndex((x) => x.id === item.id);
+          const fresh = { ...item, created: item.created || now, updated: now };
+          if (i < 0) { if (k === 'add') list.push(fresh); }
+          else if (list[i].deleted) { if (k === 'add') list[i] = fresh; }   // editing something deleted elsewhere: skip
+          else list[i] = { ...list[i], ...item, updated: now };
+        } else if (k === 'remove' && (op.kind === 'bookmarks' || op.kind === 'highlights')) {
+          st[op.kind] = st[op.kind].map((x) => (x.id === op.id ? { id: x.id, created: x.created || 0, deleted: true, updated: now } : x));
+        } else if (k === 'listened') {
+          const day = String(op.date).slice(0, 10);
+          const mine = st.listened[replica] || (st.listened[replica] = {});
+          mine[day] = Math.round(((mine[day] || 0) + Math.max(0, Math.min(+op.seconds || 0, 3600))) * 10) / 10;
+        } else if (k === 'finished') {
+          st.finished = op.value ? now : null; st.finishedUpdated = now;
+        } else if (k === 'restart') {
+          st.position = { time: 0, cfi: null, updated: now, device: op.device };
+          st.finished = null; st.finishedUpdated = now;
+        }
       }
-    }
-    await LocalDB.put('state', st, id);
+      await this.saveRaw(id, st);
+      return st;
+    });
+    PhoneSync.mark(id);
     return st;
   },
 
   async stats() {
     const perDay = {};
     for (const b of await LocalDB.all('books')) {
-      for (const [d, s] of Object.entries((await this.state(b.id)).listened)) perDay[d] = (perDay[d] || 0) + s;
+      for (const days of Object.values((await this.state(b.id)).listened)) {       // every device's listening time
+        for (const [d, s] of Object.entries(days)) perDay[d] = (perDay[d] || 0) + s;
+      }
     }
     const iso = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
     const now = new Date();
@@ -146,15 +197,18 @@ const Local = {
     };
   },
 
+  // returns true when reading data that hasn't been synced yet was kept (it is sent when possible)
   async remove(id) {
+    const keep = !(await PhoneSync.forget(id));       // unsent reading data stays until it has been sent
     for (const k of ['epub', 'sync']) await LocalDB.del('files', `${id}/${k}`);
     await LocalDB.delPrefix('chunks', `${id}/audio/`);
     await LocalDB.del('books', id);
-    await LocalDB.del('state', id);
+    if (!keep) await LocalDB.del('state', id);
     const u = this.urls[id];
     if (u) Object.values(u).forEach((x) => { if (x.startsWith('blob:')) URL.revokeObjectURL(x); });
     delete this.urls[id];
     coverCache.delete(id);
+    return keep;
   },
 };
 
@@ -247,7 +301,9 @@ if (OFFLINE) {
     if (path === 'api/stats') return json(await Local.stats());
     if (path.startsWith('api/state/')) {
       const id = decodeURIComponent(path.slice('api/state/'.length));
-      return json(opts.method === 'POST' ? await Local.apply(id, JSON.parse(opts.body || '[]')) : await Local.state(id));
+      if (opts.method === 'POST') return json(await Local.apply(id, JSON.parse(opts.body || '[]')));
+      await PhoneSync.pullBook(id);                          // newest progress from the other devices first
+      return json(await Local.state(id));
     }
     if (path === 'api/ping') return json({ ok: true });
     throw new Error('404');
@@ -257,11 +313,19 @@ if (OFFLINE) {
   audio.addEventListener('error', async () => {
     const src = audio.getAttribute('src') || '';
     if (!src.includes('local-audio/') || !S.meta) return;
-    const t = audio.currentTime;
+    const t = S.audioReady ? audio.currentTime : ((store.get('pos:' + S.meta.id) || {}).time || 0);
+    S.audioReady = false;                             // don't save the 0 a reload starts at
+    const id = S.meta.id;
     try {
-      audio.src = await Local.audioFallback(S.meta.id);
+      const url = await Local.audioFallback(id);
+      if (!S.meta || S.meta.id !== id) return;        // another book was opened meanwhile
+      audio.addEventListener('loadedmetadata', () => {
+        if (!S.meta || S.meta.id !== id) return;
+        if (t) audio.currentTime = t;
+        S.audioReady = true;
+      }, { once: true });
+      audio.src = url;
       S.meta.audio = audio.src;
-      audio.addEventListener('loadedmetadata', () => { if (t) audio.currentTime = t; }, { once: true });
     } catch (e) { toast('This book\u2019s audio could not be loaded.'); }
   });
 
@@ -301,10 +365,13 @@ if (OFFLINE) {
   $('#info-remove').hidden = false;
   $('#info-remove').addEventListener('click', async () => {
     if (!infoBook) return;
-    if (!confirm(`Remove “${infoBook.title}” from this device? Your bookmarks and notes for it are removed too.`)) return;
-    await Local.remove(infoBook.id);
+    const syncing = PhoneSync.configured();
+    if (!confirm(syncing
+      ? `Remove “${infoBook.title}” from this device? Your progress, bookmarks and notes stay in sync and come back if you add the book again.`
+      : `Remove “${infoBook.title}” from this device? Your bookmarks and notes for it are removed too.`)) return;
+    const kept = await Local.remove(infoBook.id);
     $('#info-dialog').hidden = true;
-    toast('Removed.', 1800);
+    toast(kept ? 'Removed. Your latest progress and notes will be synced when there’s internet.' : 'Removed.', kept ? 4500 : 1800);
     showLibrary();
   });
 
