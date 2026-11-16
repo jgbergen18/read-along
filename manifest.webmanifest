@@ -1,6 +1,6 @@
 {
-  "name": "Read-Along",
-  "short_name": "Read-Along",
+  "name": "Immersive Reader",
+  "short_name": "Immersive Reader",
   "description": "Read your ebooks while the audiobook plays, with pages that turn by themselves.",
   "start_url": "./",
   "scope": "./",

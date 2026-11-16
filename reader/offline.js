@@ -1,5 +1,5 @@
 'use strict';
-/* Read-Along offline mode: the version that runs on its own on a phone (installed from the web,
+/* Immersive Reader offline mode: the version that runs on its own on a phone (installed from the web,
  * no laptop needed). Books are imported from a ".readalong" file and stored on the device; the
  * library, reading positions, bookmarks, highlights and stats are kept on the device too.
  *
@@ -32,7 +32,7 @@ const LocalDB = {
           res(d);
         };
         r.onerror = () => rej(r.error);
-        r.onblocked = () => { try { toast('Close Read-Along in your other tabs to finish updating it.', 8000); } catch { /* ignore */ } };
+        r.onblocked = () => { try { toast('Close Immersive Reader in your other tabs to finish updating it.', 8000); } catch { /* ignore */ } };
       });
     }
     return this.db;
@@ -53,6 +53,23 @@ const LocalDB = {
   del(store, key) { return this.run(store, 'readwrite', (s) => s.delete(key)); },
   delPrefix(store, prefix) { return this.run(store, 'readwrite', (s) => s.delete(IDBKeyRange.bound(prefix, prefix + '\uffff'))); },
   keys(store) { return this.run(store, 'readonly', (s) => s.getAllKeys()); },
+  count(store, query) { return this.run(store, 'readonly', (s) => s.count(query)); },
+  // a book's record and everything stored for it, in one step: all of it goes, or (if interrupted) none of it
+  async delBook(id, withState) {
+    const db = await this.open();
+    const stores = withState ? ['books', 'files', 'chunks', 'state'] : ['books', 'files', 'chunks'];
+    return new Promise((res, rej) => {
+      const t = db.transaction(stores, 'readwrite');
+      const range = IDBKeyRange.bound(`${id}/`, `${id}/\uffff`);
+      t.objectStore('books').delete(id);
+      t.objectStore('files').delete(range);
+      t.objectStore('chunks').delete(range);
+      if (withState) t.objectStore('state').delete(id);
+      t.oncomplete = () => res();
+      t.onerror = () => rej(t.error);
+      t.onabort = () => rej(t.error || new Error('Storage was refused.'));
+    });
+  },
 };
 
 // ---------------------------------------------------------------- the local "server"
@@ -60,6 +77,7 @@ const Local = {
   urls: {},          // id -> { epub, audio, sync } object URLs for the stored files
   locks: {},         // id -> promise: one change to a book's reading data at a time
   replicaId: null,
+  removing: new Set(),  // ids of books being removed right now
 
   // a stable id for this phone's copy of the reading data (listening time is kept per device)
   async replica() {
@@ -240,19 +258,25 @@ const Local = {
     let info;
     try { info = await this.storageInfo(); } catch { return; }
     if (info.free != null && bytes > info.free * 0.95) {
-      throw new Error(`There isn’t enough room in Read-Along on this phone: this book needs ${sizeText(bytes)} and it can store about ${sizeText(info.free)} more. `
+      throw new Error(`There isn’t enough room in Immersive Reader on this phone: this book needs ${sizeText(bytes)} and it can store about ${sizeText(info.free)} more. `
         + 'Remove a book you’ve finished (ⓘ → Remove from this device) and try again.');
     }
   },
 
   async remove(id) {
-    const syncing = PhoneSync.configured();
-    const sent = await PhoneSync.forget(id);          // try to send what's new first
-    await LocalDB.delPrefix('files', `${id}/`);        // every copy of its book files and audio
-    await LocalDB.delPrefix('chunks', `${id}/`);
-    await LocalDB.del('books', id);
-    if (!syncing) await LocalDB.del('state', id);     // with sync on, its reading data stays in sync (and comes back with the book)
-    const keep = syncing && !sent;
+    const adding = 'This book is being added to the phone right now. Remove it once that’s done.';
+    if (ImportSink.busy(id)) throw new Error(adding);
+    this.removing.add(id);
+    let keep;
+    try {
+      const syncing = PhoneSync.configured();
+      const sent = await PhoneSync.forget(id);          // try to send what's new first
+      if (ImportSink.busy(id)) throw new Error(adding);
+      // every copy of its files and audio, and its record; with sync on, its reading data stays in sync
+      // (and comes back with the book)
+      await LocalDB.delBook(id, !syncing);
+      keep = syncing && !sent;
+    } finally { this.removing.delete(id); }
     const u = this.urls[id];
     if (u) Object.values(u).forEach((x) => { if (x.startsWith('blob:')) URL.revokeObjectURL(x); });
     delete this.urls[id];
@@ -270,7 +294,7 @@ async function renderStorage() {
   try { info = await Local.storageInfo(); } catch { el.hidden = true; return; }
   const n = info.books.length;
   $('#storage-used').textContent = n ? `${n} book${n === 1 ? '' : 's'} on this phone · ${sizeText(info.booksBytes)}` : 'No books on this phone yet';
-  // (the browser only tells how much more Read-Along may store; the phone's own free space can be less)
+  // (the browser only tells how much more Immersive Reader may store; the phone's own free space can be less)
   $('#storage-free').textContent = info.free != null ? `room for up to ~${sizeText(info.free)} more` : '';
   const low = info.free != null && info.free < 1.5e9;
   el.classList.toggle('low', low);
@@ -334,18 +358,28 @@ async function readStoredZip(file) {
 // over in one step (the book record says which keys it uses), then removes the old copy. So a transfer
 // or import that breaks off never costs the copy you had.
 const ImportSink = {
-  active: new Set(),                                                 // keys of copies being stored right now
+  active: new Map(),                                  // audio key -> a copy being stored right now
+  importing: 0,                                       // "Add book" imports running (from the moment a file is picked)
+  cleaning: null,                                     // a cleanup in progress (never at the same time as storing)
+  busy(id) { return [...this.active.values()].some((s) => s.id === id); },
   async begin(id) {
     if (navigator.storage && navigator.storage.persist) { try { await navigator.storage.persist(); } catch { /* ignore */ } }
+    while (this.cleaning) await this.cleaning;
     const gen = Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
-    const s = { id, audioKey: `${id}/audio@${gen}/`, epubKey: `${id}/epub@${gen}`, syncKey: `${id}/sync@${gen}` };
-    this.active.add(s.audioKey);
+    const s = { id, audioKey: `${id}/audio@${gen}/`, epubKey: `${id}/epub@${gen}`, syncKey: `${id}/sync@${gen}`, aborted: false };
+    this.active.set(s.audioKey, s);
     return s;
   },
   putFile(s, kind, buf) { return LocalDB.put('files', buf, kind === 'epub' ? s.epubKey : s.syncKey); },
   putAudio(s, n, buf) { return LocalDB.put('chunks', buf, s.audioKey + n); },
   async finish(s, meta, audioSize, otherBytes) {
+    if (s.aborted || !this.active.has(s.audioKey)) throw new Error('Stopped.');
+    // only switch the book over once every piece is really stored
+    const [pieces, epub, sync] = await Promise.all([
+      LocalDB.count('chunks', IDBKeyRange.bound(s.audioKey, s.audioKey + '\uffff')), LocalDB.count('files', s.epubKey), LocalDB.count('files', s.syncKey)]);
+    if (pieces !== Math.ceil(audioSize / CHUNK) || !epub || !sync) throw new Error('Part of the book went missing while it was being stored. Please try again.');
     const old = await LocalDB.get('books', s.id);
+    if (s.aborted) throw new Error('Stopped.');
     await LocalDB.put('books', {
       audioSize, audioType: 'audio/mp4', bytes: audioSize + (otherBytes || 0),
       audioKey: s.audioKey, epubKey: s.epubKey, syncKey: s.syncKey,
@@ -354,41 +388,90 @@ const ImportSink = {
       syncMode: meta.syncMode || 'dense', added: Date.now(),
     });
     this.active.delete(s.audioKey);
-    if (old) {                                                       // the copy it replaces
-      const oldAudio = old.audioKey || `${s.id}/audio/`;
-      if (oldAudio !== s.audioKey) await LocalDB.delPrefix('chunks', oldAudio);
-      for (const k of [old.epubKey || `${s.id}/epub`, old.syncKey || `${s.id}/sync`]) if (k !== s.epubKey && k !== s.syncKey) await LocalDB.del('files', k);
+    if (old) {                                                       // the copy it replaces (if this fails, cleanup frees it later)
+      try {
+        const oldAudio = old.audioKey || `${s.id}/audio/`;
+        if (oldAudio !== s.audioKey) await LocalDB.delPrefix('chunks', oldAudio);
+        for (const k of [old.epubKey || `${s.id}/epub`, old.syncKey || `${s.id}/sync`]) if (k !== s.epubKey && k !== s.syncKey) await LocalDB.del('files', k);
+      } catch { /* ignore */ }
     }
     const u = Local.urls[s.id];
     if (u) Object.values(u).forEach((x) => { if (String(x).startsWith('blob:')) URL.revokeObjectURL(x); });
     delete Local.urls[s.id];
     coverCache.delete(s.id);
   },
-  // an import that didn't finish: remove what it stored so far (any copy that was there stays)
+  // an import that didn't finish: remove what it stored so far (any copy that was there stays). Never removes
+  // a copy the book already uses (if it got as far as switching over, it is kept).
   async abort(s) {
+    s.aborted = true;
     this.active.delete(s.audioKey);
+    let b;
+    try { b = await LocalDB.get('books', s.id); } catch { return; }      // (then cleanup frees it later)
+    if (b && (b.audioKey === s.audioKey || b.epubKey === s.epubKey || b.syncKey === s.syncKey)) return;
     await LocalDB.delPrefix('chunks', s.audioKey);
     await LocalDB.del('files', s.epubKey);
     await LocalDB.del('files', s.syncKey);
   },
-  // copies left half-stored when the app was closed in the middle: free their space
-  async cleanup() {
-    const used = new Set();
-    for (const b of await LocalDB.all('books')) used.add(b.audioKey || `${b.id}/audio/`).add(b.epubKey || `${b.id}/epub`).add(b.syncKey || `${b.id}/sync`);
+  // free the space of copies no book uses: left half-stored when the app was closed in the middle of adding
+  // a book, or an old copy whose removal was interrupted (also ones stored by older versions of the app).
+  // Never runs while a book is being stored.
+  cleanup() {
+    if (this.active.size || this.cleaning) return this.cleaning || Promise.resolve();
+    const run = this.sweep().catch(() => {});
+    this.cleaning = run.then(() => { this.cleaning = null; });
+    return this.cleaning;
+  },
+  async sweep() {
+    const used = new Set(), have = new Set((await LocalDB.keys('files')).map(String));
+    for (const b of await LocalDB.all('books')) {
+      const epub = b.epubKey || `${b.id}/epub`, sync = b.syncKey || `${b.id}/sync`;
+      // a book whose files are gone can't be opened, and the library doesn't show it (an older version could
+      // leave one behind when a Remove was interrupted): drop it, so its audio is freed below
+      if (!have.has(epub) || !have.has(sync)) { await LocalDB.del('books', b.id); continue; }
+      used.add(b.audioKey || `${b.id}/audio/`).add(epub).add(sync);
+    }
     const stale = new Set();
     for (const k of await LocalDB.keys('chunks')) {
-      const m = /^(.*\/audio@[^/]+\/)\d+$/.exec(String(k));
-      if (m && !used.has(m[1]) && !this.active.has(m[1])) stale.add(m[1]);
+      const m = /^(.*\/audio(?:@[^/]+)?\/)\d+$/.exec(String(k));      // <book>/audio@<copy>/<n> (older versions: <book>/audio/<n>)
+      if (m && !used.has(m[1])) stale.add(m[1]);
     }
     for (const p of stale) await LocalDB.delPrefix('chunks', p);
     for (const k of await LocalDB.keys('files')) {
-      const m = /^(.*)\/(epub|sync)@([^/]+)$/.exec(String(k));
-      if (m && !used.has(String(k)) && !this.active.has(`${m[1]}/audio@${m[3]}/`)) await LocalDB.del('files', k);
+      if (/\/(epub|sync)(@[^/]+)?$/.test(String(k)) && !used.has(String(k))) await LocalDB.del('files', k);
     }
   },
 };
 
+// adding, receiving or removing a book right now (a new version of the app waits until that's done)
+function phoneBusy() {
+  return ImportSink.active.size > 0 || ImportSink.importing > 0 || Local.removing.size > 0 || (typeof Receiver !== 'undefined' && Receiver.busy);
+}
+// a book was added, received or removed (or that failed): a new version of the app that arrived meanwhile
+// switches in a moment (after the message has been read), if the library is showing with nothing open
+function updateAfterBusy() {
+  if (window.__reloadForUpdate && window.__switchToUpdate) setTimeout(() => { if (!phoneBusy()) window.__switchToUpdate(); }, 6000);
+}
+// a book was added, replaced or removed: refresh the library if it's showing. A book that's open (or still
+// opening) is left alone, unless it's the very book that was just replaced or removed (its files changed).
+// A new version of the app that's waiting doesn't switch here (the message comes first): updateAfterBusy.
+async function libraryAfterChange(id) {
+  // its info sheet, if open, still shows the copy that was just replaced or removed (its files are gone): close it
+  if (!$('#info-dialog').hidden && infoBook && infoBook.id === id) $('#info-dialog').hidden = true;
+  if ($('#library').hidden && !(S.meta && S.meta.id === id)) return;
+  await showLibrary({ deferUpdate: true });
+}
+// phone app, the book info sheet: its Remove button says when the book shown is being removed
+function showRemoveState(b) {
+  const btn = $('#info-remove'), now = !!(b && Local.removing.has(b.id));
+  btn.disabled = now;
+  btn.textContent = now ? 'Removing…' : 'Remove from this device';
+}
+
 async function importPack(file, onStatus) {
+  ImportSink.importing++;
+  try { return await importPackNow(file, onStatus); } finally { ImportSink.importing--; }
+}
+async function importPackNow(file, onStatus) {
   onStatus('Reading the file…');
   await Local.checkSpace(file.size);
   const z = await readStoredZip(file);
@@ -396,7 +479,7 @@ async function importPack(file, onStatus) {
     if (!z[need]) throw new Error(`This file is missing ${need}.`);
   }
   const meta = JSON.parse(await z['meta.json'].text());
-  if (!meta.id || !meta.title) throw new Error('This file is missing the book details.');
+  if (!meta.id || !meta.title || /[\\/]/.test(meta.id)) throw new Error('This file is missing the book details.');
   const audio = z['audio.m4a'];
   const mb = (audio.size / 1048576).toFixed(0);
   const stage = await ImportSink.begin(meta.id);
@@ -423,33 +506,58 @@ if (OFFLINE) {
 
   // a new version of the app arrived in the background (the offline helper updated itself): switch to it
   // at a calm moment, now if the library is showing with nothing open, else when you're back in the library
+  // (calm: the library showing, no book open, no window open, no book being stored or received)
+  const calmNow = () => !S.book && !phoneBusy() && !$('#library').hidden && $$('.modal').every((m) => m.hidden);
+  let switching = false;
   window.__switchToUpdate = async () => {
-    try { await Promise.allSettled([...Local.pending]); } catch { /* ignore */ }   // let saving finish first
-    try {            // the old helper may still be busy (audio of a book just closed): give it a moment to hand over
-      const reg = await navigator.serviceWorker.getRegistration();
-      if (reg && reg.waiting) {
-        await new Promise((res) => { navigator.serviceWorker.addEventListener('controllerchange', res, { once: true }); setTimeout(res, 3000); });
-      }
-    } catch { /* ignore */ }
-    try { sessionStorage.setItem('ra:updated-at', String(Date.now())); } catch { /* ignore */ }
-    location.reload();
+    if (switching) return;
+    switching = true;
+    try {
+      try { await Promise.allSettled([...Local.pending]); } catch { /* ignore */ }   // let saving finish first
+      try {          // the old helper may still be busy (the audio of a book just closed): give it a moment to hand
+        const reg = await navigator.serviceWorker.getRegistration();         // over (if it can't yet, the page
+        if (reg && reg.waiting) {                                            // after the reload notices: outdated())
+          await new Promise((res) => { navigator.serviceWorker.addEventListener('controllerchange', res, { once: true }); setTimeout(res, 3000); });
+        }
+      } catch { /* ignore */ }
+      if (!calmNow()) { window.__reloadForUpdate = true; return; }    // something was opened meanwhile: next time
+      // at most 4 of these reloads in 2 minutes (a switch can take two: the reload, and a catch-up if the old helper
+      // was still in charge as the page loaded); if something keeps going wrong, it switches when the app is next opened
+      let recent = [];
+      try { recent = JSON.parse(sessionStorage.getItem('ra:update-reloads') || '[]').filter((t) => Date.now() - t < 120000); } catch { /* ignore */ }
+      if (recent.length >= 4) return;
+      try {
+        sessionStorage.setItem('ra:update-reloads', JSON.stringify([...recent, Date.now()]));
+        sessionStorage.setItem('ra:updated-at', String(Date.now()));
+      } catch { /* ignore */ }
+      location.reload();
+    } finally { switching = false; }
   };
   if ('serviceWorker' in navigator) {
     const hadHelper = !!navigator.serviceWorker.controller;
-    const ready = () => {
-      const receiving = typeof Receiver !== 'undefined' && Receiver.busy;
-      const calm = !S.book && !receiving && ['#pack-dialog', '#info-dialog', '#sync-dialog', '#receive-dialog', '#send-dialog'].every((s) => !$(s) || $(s).hidden);
-      if (calm) window.__switchToUpdate(); else window.__reloadForUpdate = true;
-    };
+    const ready = () => { if (calmNow()) window.__switchToUpdate(); else window.__reloadForUpdate = true; };
     navigator.serviceWorker.addEventListener('controllerchange', () => { if (hadHelper) ready(); });   // (first visit: already newest)
-    // a new version is installed but still waiting (the old helper is busy, e.g. with the audio): same thing,
-    // but never reload for it twice in a row (if it keeps waiting, it takes over when the app is next opened)
+    // is this page an older version than the helper now in charge? (a new helper deletes the older version's files
+    // when it takes over; a page that was loading just then can still be the older version and miss the change)
+    const outdated = async () => {
+      if (!window.READALONG_BUILD || !window.caches || !navigator.serviceWorker.controller) return false;
+      try {
+        const keys = await caches.keys();
+        return !keys.includes('read-along-' + window.READALONG_BUILD) && keys.some((k) => k.startsWith('read-along-'));
+      } catch { return false; }
+    };
+    const checkOutdated = () => outdated().then((old) => { if (old) ready(); }).catch(() => {});
+    navigator.serviceWorker.ready.then(checkOutdated).catch(() => {});
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) checkOutdated(); });
+    // a new version is installed but still waiting (the old helper is busy, e.g. with the audio): same thing; just
+    // after a switch, not at once again but at the next calm moment (e.g. back in the library)
     navigator.serviceWorker.getRegistration().then((reg) => {
       if (!reg) return;
       const waitingReady = () => {
+        if (!navigator.serviceWorker.controller || !reg.waiting) return;
         let last = 0;
         try { last = +sessionStorage.getItem('ra:updated-at') || 0; } catch { /* ignore */ }
-        if (navigator.serviceWorker.controller && reg.waiting && Date.now() - last > 60000) ready();
+        if (Date.now() - last > 60000) ready(); else window.__reloadForUpdate = true;
       };
       const watch = (w) => { if (w) w.addEventListener('statechange', () => { if (w.state === 'installed') waitingReady(); }); };
       waitingReady();
@@ -457,9 +565,12 @@ if (OFFLINE) {
       reg.addEventListener('updatefound', () => watch(reg.installing));
     }).catch(() => {});
   }
-  const viaNetwork = api;
   api = async function (url, opts = {}) {
-    if (String(url).startsWith('blob:')) return viaNetwork(url, opts);
+    if (String(url).startsWith('blob:')) {           // a book's file on this phone: if it fails, that's never "can't reach your PC"
+      const r = await fetch(url, opts);
+      if (!r.ok) throw new Error(String(r.status));
+      return r;
+    }
     const path = String(url).replace(/^.*?(api\/)/, '$1').split('?')[0];
     const json = (o) => new Response(JSON.stringify(o), { headers: { 'Content-Type': 'application/json' } });
     if (path === 'api/books') return json(await Local.books());
@@ -501,7 +612,8 @@ if (OFFLINE) {
   const status = $('#pack-status');
   const err = $('#pack-error');
   openAdd = function () {
-    err.hidden = true; status.textContent = ''; $('#pack-progress').hidden = true;
+    err.hidden = true;
+    if (!pick.disabled) { status.textContent = ''; $('#pack-progress').hidden = true; }    // (a book still being added keeps its progress)
     dlg.hidden = false;
   };
   pick.addEventListener('change', async () => {
@@ -510,35 +622,42 @@ if (OFFLINE) {
     if (!file) return;
     err.hidden = true;
     $('#pack-progress').hidden = false;
-    $('#pack-choose').disabled = true;
+    pick.disabled = true;                          // one at a time (a disabled input also keeps its label from opening it)
     try {
       const meta = await importPack(file, (t) => { status.textContent = t; });
       dlg.hidden = true;
-      await showLibrary();
+      await libraryAfterChange(meta.id);           // (never interrupts another book you opened meanwhile)
       toast(`“${meta.title}” is on this device now and works offline.`, 4500);
     } catch (e) {
       err.hidden = false;
       err.textContent = e && (e.name === 'QuotaExceededError' || e.name === 'UnknownError')
         ? 'The phone ran out of space for this book. Remove a book you’ve finished (ⓘ → Remove from this device) and try again.'
         : 'Could not add this book: ' + (e && e.message ? e.message : e);
+      if (dlg.hidden) toast(err.textContent, 8000);                 // (the window was closed meanwhile)
     } finally {
       $('#pack-progress').hidden = true;
-      $('#pack-choose').disabled = false;
+      pick.disabled = false;
+      updateAfterBusy();
     }
   });
 
   // info sheet: remove a book from the device
   $('#info-remove').hidden = false;
   $('#info-remove').addEventListener('click', async () => {
-    if (!infoBook) return;
+    const b = infoBook;                            // (the sheet can show another book by the time this is done)
+    if (!b || Local.removing.has(b.id)) return;    // (already being removed)
+    if (ImportSink.busy(b.id)) { toast('This book is being added to the phone right now. Remove it once that’s done.', 4500); return; }
     const syncing = PhoneSync.configured();
     if (!confirm(syncing
-      ? `Remove “${infoBook.title}” from this device? Your progress, bookmarks and notes stay in sync and come back if you add the book again.`
-      : `Remove “${infoBook.title}” from this device? Your bookmarks and notes for it are removed too.`)) return;
-    const kept = await Local.remove(infoBook.id);
-    $('#info-dialog').hidden = true;
-    await showLibrary();
+      ? `Remove “${b.title}” from this device? Your progress, bookmarks and notes stay in sync and come back if you add the book again.`
+      : `Remove “${b.title}” from this device? Your bookmarks and notes for it are removed too.`)) return;
+    const removing = Local.remove(b.id);           // (it may first send the book's latest notes: that can take a moment)
+    showRemoveState(infoBook);
+    let kept;
+    try { kept = await removing; } catch (e) { toast(String((e && e.message) || e), 4500); return; } finally { showRemoveState(infoBook); }
+    await libraryAfterChange(b.id);                // (closes its sheet; never interrupts another book you opened meanwhile)
     toast(kept ? 'Removed. Your latest progress and notes will be synced when there’s internet.' : 'Removed.', kept ? 4500 : 1800);
+    updateAfterBusy();
   });
 
   setTimeout(() => ImportSink.cleanup().catch(() => {}), 8000);      // half-stored copies from an interrupted import

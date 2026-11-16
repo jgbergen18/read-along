@@ -1,4 +1,4 @@
-# Read-Along
+# Immersive Reader
 
 Read an ebook while its audiobook plays: pages turn by themselves and the words being spoken are
 highlighted. This is the stand-alone version that runs on a phone, with no computer needed. After the
@@ -15,7 +15,7 @@ unless you turn on sync (then they also go to your own private repository, and n
 
 ## Using it on an iPhone
 
-1. Open the site in **Safari**, tap **Share → Add to Home Screen**, then open *Read-Along* from the
+1. Open the site in **Safari**, tap **Share → Add to Home Screen**, then open *Immersive Reader* from the
    home screen (books and offline use belong to the home-screen app).
 2. Tap **Add book** and choose a book's `.readalong` file (from the Files app).
 3. Play. It works without internet from then on.

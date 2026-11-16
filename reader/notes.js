@@ -1,5 +1,5 @@
 'use strict';
-/* Read-Along: things you keep while reading.
+/* Immersive Reader: things you keep while reading.
  *  - Shared: reading state stored on the PC (position, bookmarks, highlights, listening time), so the
  *    PC and paired phones all see the same thing
  *  - Notes: bookmarks, highlights with notes, the selection menu, the notes panel and export
@@ -349,7 +349,7 @@ const Notes = {
     const title = S.meta.title, author = S.meta.author || '';
     const all = [...this.list('bookmarks').map((b) => ({ ...b, kind: 'bookmark' })), ...this.list('highlights').map((h) => ({ ...h, kind: 'highlight' }))]
       .sort((a, b) => (a.word ?? 1e12) - (b.word ?? 1e12));
-    let md = `# ${title}\n${author ? `*${author}*\n` : ''}\nNotes exported from Read-Along on ${new Date().toLocaleDateString()}.\n`;
+    let md = `# ${title}\n${author ? `*${author}*\n` : ''}\nNotes exported from Immersive Reader on ${new Date().toLocaleDateString()}.\n`;
     let chapter = null;
     for (const x of all) {
       if (x.chapter !== chapter) { chapter = x.chapter; md += `\n## ${chapter ? chapterLabel(chapter) : 'Front matter'}\n`; }

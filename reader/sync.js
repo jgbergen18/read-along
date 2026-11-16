@@ -1,5 +1,5 @@
 'use strict';
-/* Read-Along sync: keeps reading progress, bookmarks, highlights/notes, listening time and "finished"
+/* Immersive Reader sync: keeps reading progress, bookmarks, highlights/notes, listening time and "finished"
  * the same on the laptop and the offline phone app, through a private GitHub repository (one small
  * JSON file per book). Never the books themselves.
  *
@@ -354,7 +354,7 @@ const PhoneSync = {
 
   async connect(code) {
     const m = /RA-SYNC:(\{[\s\S]*\})/.exec(String(code || '').trim());
-    if (!m) throw new Error('That isn’t a Read-Along sync code. Show the code from the laptop app (Sync → Show code for your phone).');
+    if (!m) throw new Error('That isn’t an Immersive Reader sync code. Show the code from the laptop app (Sync → Show code for your phone).');
     let p;
     try { p = JSON.parse(m[1]); } catch { throw new Error('The code is damaged; try again.'); }
     if (!p || typeof p.r !== 'string' || typeof p.t !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(p.r)) throw new Error('The code is damaged; try again.');
@@ -538,7 +538,7 @@ const SyncUI = {
       stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
     } catch {
       if (this.starting === attempt) { this.starting = null; $('#sync-scan').disabled = false; }
-      this.showError('Camera access was refused. Allow camera access for Read-Along, or paste the code instead.');
+      this.showError('Camera access was refused. Allow camera access for Immersive Reader, or paste the code instead.');
       return;
     }
     // cancelled (or the dialog closed) while the camera was starting: turn it straight off again

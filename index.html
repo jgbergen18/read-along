@@ -3,17 +3,18 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>Read-Along</title>
+  <title>Immersive Reader</title>
   <meta name="theme-color" content="#fffdf9">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-title" content="Read-Along">
+  <meta name="apple-mobile-web-app-title" content="Immersive Reader">
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <link rel="icon" href="reader/icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="reader/apple-touch-icon.png">
   <link rel="manifest" href="manifest.webmanifest" >
   <script>window.READALONG_OFFLINE = true;
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');</script>
+  <script src="reader/version.js"></script>
   <link rel="stylesheet" href="reader/reader.css">
   <link rel="stylesheet" href="reader/features.css">
   <script src="reader/vendor/jszip.min.js"></script>
@@ -51,7 +52,7 @@
   <section id="library">
     <header class="lib-head">
       <div>
-        <h1>Read-Along</h1>
+        <h1>Immersive Reader</h1>
         <p class="muted" id="lib-sub">Read along while the audiobook plays.</p>
       </div>
       <div class="head-actions">
@@ -63,7 +64,7 @@
     <div id="storage" class="storage" hidden>
       <div class="storage-row"><span id="storage-used"></span><span id="storage-free"></span></div>
       <div class="storage-bar"><i></i></div>
-      <p id="storage-low" class="tiny" hidden>Read-Along is close to how much it may store on this phone. Remove a book you’ve finished: ⓘ → <b>Remove from this device</b> (your progress and notes stay in sync).</p>
+      <p id="storage-low" class="tiny" hidden>Immersive Reader is close to how much it may store on this phone. Remove a book you’ve finished: ⓘ → <b>Remove from this device</b> (your progress and notes stay in sync).</p>
     </div>
     <div id="stats" class="stats" hidden></div>
     <div id="jobs"></div>
@@ -205,7 +206,7 @@
   <!-- ============ Phone pairing ============ -->
   <div id="phone-dialog" class="modal" hidden>
     <div class="modal-card" role="dialog" aria-labelledby="phone-h">
-      <div class="panel-head"><strong id="phone-h">Use Read-Along on your phone</strong><button class="icon" data-close-modal aria-label="Close"><svg><use href="#i-close"/></svg></button></div>
+      <div class="panel-head"><strong id="phone-h">Use Immersive Reader on your phone</strong><button class="icon" data-close-modal aria-label="Close"><svg><use href="#i-close"/></svg></button></div>
       <div class="modal-body">
         <label class="switch-row">
           <span><b>Allow my phone to connect</b><br><span class="muted tiny">Over your home Wi-Fi. This PC must be on and awake.</span></span>
@@ -226,7 +227,7 @@
             <select id="ip-choice"></select>
             <span class="muted tiny">If the phone can't connect, pick your Wi-Fi's address here (it usually starts with 192.168). VPN and virtual-machine addresses won't work.</span>
           </div>
-          <label class="setting check plain"><input type="checkbox" id="opt-startup"> Start with Windows, so the phone works even when Read-Along isn't open on the PC</label>
+          <label class="setting check plain"><input type="checkbox" id="opt-startup"> Start with Windows, so the phone works even when Immersive Reader isn't open on the PC</label>
           <p class="note">If Windows asks whether to let <b>Python</b> communicate on networks, choose <b>Private networks</b> and click <b>Allow</b>. Your phone can't connect until you do.</p>
           <button id="btn-newkey" class="ghost small">Reset key (unpairs all phones)</button>
         </div>
@@ -239,7 +240,7 @@
     <div class="modal-card small">
       <div class="modal-body center">
         <h3>Can't reach your PC</h3>
-        <p class="muted">Read-Along runs on your PC. Make sure it's on and awake, Read-Along is running, and this device is on the same Wi-Fi.</p>
+        <p class="muted">Immersive Reader runs on your PC. Make sure it's on and awake, Immersive Reader is running, and this device is on the same Wi-Fi.</p>
         <button id="btn-retry" class="toggle on">Try again</button>
       </div>
     </div>
@@ -291,7 +292,7 @@
     <div class="modal-card" role="dialog" aria-labelledby="add-h">
       <div class="panel-head"><strong id="add-h">Add a book</strong><button class="icon" data-close-modal aria-label="Close"><svg><use href="#i-close"/></svg></button></div>
       <div class="modal-body">
-        <p class="muted">Choose the book's <b>.epub</b> and its audiobook (<b>.m4b</b>). Read-Along copies them into your library, matches the chapters, syncs every word and makes the phone version. That takes about 45 minutes; you can keep reading meanwhile.</p>
+        <p class="muted">Choose the book's <b>.epub</b> and its audiobook (<b>.m4b</b>). Immersive Reader copies them into your library, matches the chapters, syncs every word and makes the phone version. That takes about 45 minutes; you can keep reading meanwhile.</p>
         <div id="add-files" class="files"></div>
         <label class="ghost file-pick"><input id="add-input" type="file" accept=".epub,.m4b,.m4a" multiple hidden><svg><use href="#i-plus"/></svg><span>Choose files…</span></label>
         <div id="add-form" class="form" hidden>
@@ -329,19 +330,21 @@
       <div class="panel-head"><strong id="send-h">Send to your phone</strong><button class="icon" id="send-close" aria-label="Close"><svg><use href="#i-close"/></svg></button></div>
       <div class="modal-body">
         <p id="send-what"></p>
-        <ol id="send-steps" class="steps">
-          <li>On your iPhone, open <b>Read-Along</b> from the home screen, on its library (or with the book paused). It needs sync on and the same Wi-Fi as this PC.</li>
-          <li>Tap <b>Receive</b> when it asks. Keep it open with the screen on until it’s done (about a minute).</li>
-        </ol>
-        <p class="sync-status"><b>Status:</b> <span id="send-status"></span></p>
-        <div id="send-progress" class="upload" hidden><div class="bar"><i id="send-bar"></i></div><span id="send-pct" class="muted tiny"></span></div>
-        <p id="send-error" class="error" hidden></p>
-        <div id="send-other" class="send-other" hidden>
-          <p><b>The other way</b></p>
+        <div id="send-other" class="send-other">
           <div id="send-qr" class="qr"></div>
           <ol id="send-other-steps" class="steps"></ol>
         </div>
-        <div class="row-start"><button id="send-cancel" class="ghost">Cancel</button><button id="send-otherbtn" class="ghost">Other ways</button></div>
+        <div id="send-direct-box" hidden>
+          <p><b>Sending to the open phone app</b></p>
+          <ol id="send-steps" class="steps">
+            <li>On your iPhone, open <b>Immersive Reader</b> from the home screen, on its library (or with the book paused). It needs sync on and the same Wi-Fi as this PC.</li>
+            <li>Tap <b>Receive</b> when it asks. Keep it open with the screen on until it’s done.</li>
+          </ol>
+          <p class="sync-status"><b>Status:</b> <span id="send-status"></span></p>
+          <div id="send-progress" class="upload" hidden><div class="bar"><i id="send-bar"></i></div><span id="send-pct" class="muted tiny"></span></div>
+        </div>
+        <p id="send-error" class="error" hidden></p>
+        <div class="row-start"><button id="send-cancel" class="ghost">Close</button><button id="send-direct" class="ghost">Or send it to the open phone app</button></div>
       </div>
     </div>
   </div>
@@ -351,7 +354,7 @@
       <div class="panel-head"><strong id="recv-h">A book from your PC</strong></div>
       <div class="modal-body">
         <p id="recv-what"></p>
-        <p class="muted tiny">It comes straight over your Wi-Fi. Keep Read-Along open and the screen on until it’s done.</p>
+        <p class="muted tiny">It comes straight over your Wi-Fi. Keep Immersive Reader open and the screen on until it’s done.</p>
         <div id="recv-progress" class="upload" hidden><div class="bar"><i id="recv-bar"></i></div><span id="recv-pct" class="muted tiny"></span></div>
         <p class="sync-status tiny"><span id="recv-status"></span></p>
         <p id="recv-error" class="error" hidden></p>
@@ -370,7 +373,7 @@
           <p class="sync-status"><b>Status:</b> <span id="sync-laptop-status"></span></p>
           <div id="sync-laptop-setup">
             <ol class="steps">
-              <li><a href="https://github.com/settings/personal-access-tokens/new?name=Read-Along+sync&description=Lets+Read-Along+sync+reading+progress+(read-along-sync+repository+only)&expires_in=none&contents=write" target="_blank" rel="noopener"><b>Open GitHub's key page</b></a>. The name, expiry and permission are filled in for you. Under <b>Repository access</b>, choose <b>Only select repositories</b> and pick <b id="sync-repo-name">read-along-sync</b>. Then click <b>Generate token</b> and copy the key.</li>
+              <li><a href="https://github.com/settings/personal-access-tokens/new?name=Immersive+Reader+sync&description=Lets+Immersive+Reader+sync+reading+progress+(read-along-sync+repository+only)&expires_in=none&contents=write" target="_blank" rel="noopener"><b>Open GitHub's key page</b></a>. The name, expiry and permission are filled in for you. Under <b>Repository access</b>, choose <b>Only select repositories</b> and pick <b id="sync-repo-name">read-along-sync</b>. Then click <b>Generate token</b> and copy the key.</li>
               <li>Paste the key here:
                 <div class="token-row"><input id="sync-token" type="password" placeholder="github_pat_…" autocomplete="off" spellcheck="false"><button id="sync-connect" class="toggle on">Connect</button></div>
               </li>
@@ -381,7 +384,7 @@
             <div id="sync-qr-wrap" class="qr-wrap" hidden>
               <div id="sync-qr" class="qr"></div>
               <ol class="steps">
-                <li>On your iPhone, open <b>Read-Along from the home screen</b>.</li>
+                <li>On your iPhone, open <b>Immersive Reader from the home screen</b>.</li>
                 <li>Tap <b>Sync → Scan code</b> and point the camera at this code.</li>
               </ol>
             </div>
@@ -392,7 +395,7 @@
         <div id="sync-phone" hidden>
           <p class="sync-status"><b>Status:</b> <span id="sync-phone-status"></span></p>
           <div id="sync-phone-setup">
-            <p>On the laptop, open Read-Along → <b>Sync</b> → <b>Show code for your phone</b>. Then:</p>
+            <p>On the laptop, open Immersive Reader → <b>Sync</b> → <b>Show code for your phone</b>. Then:</p>
             <button id="sync-scan" class="toggle on">Scan code</button>
             <div id="sync-scan-box" class="scan-box" hidden>
               <video id="sync-video" playsinline muted></video>

@@ -1,5 +1,5 @@
 'use strict';
-/* Read-Along: an EPUB reader that turns pages and highlights words with the audiobook.
+/* Immersive Reader: an EPUB reader that turns pages and highlights words with the audiobook.
  *
  * Sync data (<audio>.sync.json, built by make_sync.py) maps audio time to "word number":
  * the count of whitespace-separated words in the book's <body> text, in spine order. It must
@@ -84,16 +84,17 @@ async function api(url, opts) {
 }
 
 // ================================================================ library
-async function showLibrary() {
+async function showLibrary(opts) {
   closeBook();
-  if (window.__reloadForUpdate && window.__switchToUpdate && !(typeof Receiver !== 'undefined' && Receiver.busy)) {
-    window.__switchToUpdate(); return;                         // phone app: a new version is ready
-  }
+  // phone app: a new version is ready. The library shows meanwhile; it switches once the new version has taken
+  // over, if the library is still showing with nothing open (not right after a book was added or removed: its
+  // message is shown first, see updateAfterBusy)
+  if (!(opts && opts.deferUpdate) && window.__reloadForUpdate && window.__switchToUpdate) window.__switchToUpdate();
   document.body.classList.remove('immersive');
   $('#toast').hidden = true;
   $('#reader').hidden = true;
   $('#library').hidden = false;
-  document.title = 'Read-Along';
+  document.title = 'Immersive Reader';
   $('#btn-phone').hidden = !isLocal;
   $('#btn-add').hidden = !(isLocal || OFFLINE);
   let books, stats = null;
@@ -136,7 +137,7 @@ async function openBook(meta) {
   $('#loading').hidden = false;
   $('#book-title').textContent = meta.title;
   $('#chapter-title').textContent = '';
-  document.title = meta.title + ' · Read-Along';
+  document.title = meta.title + ' · Immersive Reader';
   updateFollowUI();
   let pos = store.get('pos:' + meta.id) || {};
   const shared = await Shared.load(meta.id);         // notes.js: state shared by all devices
@@ -165,6 +166,8 @@ async function openBook(meta) {
     await loadSync();
     if (stale()) return;
     S.book = ePub(meta.epub, { openAs: 'epub' });
+    // a book file that can't be opened (damaged, or gone): epub.js only reports it, "ready" never comes
+    const openFailed = new Promise((res, rej) => S.book.on('openFailed', rej));
     S.rendition = S.book.renderTo('viewer', {
       width: '100%', height: '100%', flow: 'paginated',
       spread: settings.spread && !isTouch ? 'auto' : 'none', minSpreadWidth: 1100, allowScriptedContent: false,
@@ -174,13 +177,14 @@ async function openBook(meta) {
     applySettings(false);
     S.rendition.on('relocated', (loc) => { S.loc = loc; onRelocated(); });
     S.rendition.on('keydown', onKey);
-    await S.book.ready;
+    await Promise.race([S.book.ready, openFailed]);
     if (stale()) return;
     buildToc();
     Notes.attach();                                  // notes.js: highlights, selection menu
     S.book.coverUrl().then((u) => { S.coverUrl = u; setupMediaSession(); }).catch(() => {});
   } catch (e) {
     console.error(e);
+    if (stale()) return;                             // (another book was opened, or the library shown, meanwhile)
     $('#loading').hidden = true;
     toast('Could not open this book.');
     return;
@@ -805,7 +809,7 @@ function setupMediaSession() {
   if (!('mediaSession' in navigator) || !S.meta) return;
   try {
     navigator.mediaSession.metadata = new MediaMetadata({
-      title: S.meta.title, artist: 'Read-Along',
+      title: S.meta.title, artist: 'Immersive Reader',
       artwork: S.coverUrl ? [{ src: S.coverUrl, sizes: '512x768', type: 'image/jpeg' }] : [{ src: 'reader/icon-512.png', sizes: '512x512', type: 'image/png' }],
     });
   } catch { /* ignore */ }

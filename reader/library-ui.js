@@ -1,5 +1,5 @@
 'use strict';
-/* Read-Along library screen: continue / up next, listening stats, series shelves, book info, and
+/* Immersive Reader library screen: continue / up next, listening stats, series shelves, book info, and
  * adding new books (drag & drop or file picker → upload → background preparation with progress).
  * Uses globals from reader.js and notes.js.
  */
@@ -173,6 +173,7 @@ function showInfo(b) {
     $('#info-facts').insertAdjacentHTML('beforeend', `<span>Phone version: ${Math.round(b.packSize / 1048576)} MB</span>`);
   }
   if (OFFLINE) {                                 // how much space this book takes on the phone
+    showRemoveState(b);                          // offline.js
     Local.storageInfo().then((info) => {
       const me = info.books.find((x) => x.id === b.id);
       if (me && infoBook === b) $('#info-facts').insertAdjacentHTML('beforeend', `<span>${esc(sizeText(me.bytes))} on this phone</span>`);
@@ -324,7 +325,7 @@ async function pollJobs() {
   clearTimeout(jobsTimer);
   let jobs;
   try { jobs = await (await fetch('api/jobs', { cache: 'no-store' })).json(); } catch { return; }
-  const wasRunning = new Set(jobsCache.filter((j) => j.state === 'running' || j.state === 'queued').map((j) => j.folder));
+  const wasRunning = new Set(jobsCache.filter((j) => j.state === 'running' || j.state === 'queued').map((j) => j.id));
   const wasBlocking = blockingJobs(jobsCache);
   jobsCache = jobs;
   const el = $('#jobs');
@@ -334,7 +335,7 @@ async function pollJobs() {
       ${j.state === 'running' || j.state === 'queued' ? `<div class="bar"><i style="width:${(100 * j.progress).toFixed(1)}%"></i></div>` : ''}
       <div class="muted tiny">${esc(j.state === 'error' ? j.message : j.state === 'running' ? `${j.message || ''}${j.eta ? ` · about ${mins(j.eta)} left` : ''}` : j.warning || '')}</div>
     </div>`).join('');
-  const finishedNow = jobs.filter((j) => (j.state === 'done' || j.state === 'error') && wasRunning.has(j.folder));
+  const finishedNow = jobs.filter((j) => (j.state === 'done' || j.state === 'error') && wasRunning.has(j.id));
   if (finishedNow.length && !$('#library').hidden) {
     const names = (list) => list.map((j) => j.folder).join(', ');
     const ok = finishedNow.filter((j) => j.state === 'done');

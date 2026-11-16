@@ -1,5 +1,5 @@
 'use strict';
-/* Read-Along: "Send to phone" — a book's phone version goes straight from the laptop app to the phone
+/* Immersive Reader: "Send to phone" — a book's phone version goes straight from the laptop app to the phone
  * app over the Wi-Fi (WebRTC data channel), with no cloud in between and no Files app.
  *
  *  - The two apps find each other through the private sync repository: the PC leaves a small "offer"
@@ -10,9 +10,9 @@
  *  - Phone (Receiver): notices the offer while its library (or a paused book) is showing and asks
  *    "Receive?". Stores the book next to any copy it already has (ImportSink), and only switches over
  *    once everything has arrived, so a broken transfer never costs the copy that was there.
- * If the two can't connect directly (some Wi-Fi networks keep devices apart; on Windows the PC must reach
- * the phone first), the laptop shows the other way: a code the iPhone camera can scan to download the
- * file, then Add book.
+ * The window shows the simplest way first: a code the iPhone camera scans to download the file over the
+ * Wi-Fi, then Add book. Sending straight to the open phone app is the second option (some Wi-Fi networks
+ * keep devices apart, and on Windows the PC must reach the phone first).
  */
 const XFER_MSG = 64 * 1024;             // one message on the data channel (both engines accept up to 256 KB)
 const XFER_HIGH = 4 * 1024 * 1024;      // pause while more than this waits in the browser's send queue (max 16 MB)
@@ -87,31 +87,58 @@ const Xfer = {
 const Sender = {
   run: null,                                     // the transfer in progress: { id, pc, cancelled, book }
   lastBook: null,
+  closeTimer: null,                              // closes the window a moment after a successful send
+  hasCode: false,                                // the window shows the download code
 
-  available() { return isLocal && !OFFLINE && Xfer.supported(); },
+  // what to do instead when sending straight to the phone app doesn't work
+  otherWay() {
+    return this.hasCode ? 'Use the code above instead.'
+      : 'Instead, turn on Use on phone (top right of the library) and open this window again for a download code.';
+  },
+
+  available() { return isLocal && !OFFLINE; },          // (the download code works in any browser)
+
+  // ⓘ → Send to phone: the download code comes first (it works on any home Wi-Fi); sending straight to the
+  // open phone app is the other option (it needs the PC to be able to reach the phone directly)
+  async open(book) {
+    clearTimeout(this.closeTimer);
+    if (this.run) { this.ui({ open: true }); return; }
+    this.lastBook = book;
+    $('#send-what').textContent = `Put “${book.title}” on your phone:`;
+    $('#send-direct-box').hidden = true;
+    $('#send-direct').hidden = !Xfer.supported();
+    $('#send-error').hidden = true;
+    $('#send-cancel').textContent = 'Close';
+    $('#send-dialog').hidden = false;
+    await this.showOther();
+  },
 
   ui(state) {
     const d = $('#send-dialog');
     if (state.open) d.hidden = false;
     if ('status' in state) $('#send-status').textContent = state.status;
     if ('error' in state) { $('#send-error').hidden = !state.error; $('#send-error').textContent = state.error || ''; }
+    if (state.error || state.done) $('#send-dialog .row-start').scrollIntoView({ block: 'nearest' });
     if ('pct' in state) {
       $('#send-progress').hidden = state.pct == null;
       if (state.pct != null) { $('#send-bar').style.width = `${state.pct.toFixed(1)}%`; $('#send-pct').textContent = state.detail || ''; }
     }
     if ('steps' in state) $('#send-steps').hidden = !state.steps;
-    if ('other' in state && state.other) this.showOther();
-    if ('done' in state) { $('#send-cancel').textContent = state.done ? 'Close' : 'Cancel'; }
+    if ('done' in state) {
+      $('#send-cancel').textContent = state.done ? 'Close' : 'Cancel';
+      $('#send-direct').hidden = !state.done;                   // (can try again once this attempt is over)
+    }
   },
 
   async start(book) {
+    clearTimeout(this.closeTimer);
     if (this.run) { this.ui({ open: true }); return; }     // one at a time: show the one that's running
     this.lastBook = book;
     const run = { id: null, pc: null, cancelled: false, book };
     this.run = run;
-    $('#send-what').textContent = `Send “${book.title}” to the Read-Along app on your phone, over your Wi-Fi.`;
-    $('#send-other').hidden = true;
+    $('#send-direct-box').hidden = false;
     this.ui({ open: true, status: 'Getting ready…', error: '', pct: null, steps: true, done: false });
+    $('#send-direct-box').scrollIntoView({ block: 'nearest' });       // (it's below the code: keep it in view)
     try {
       const sync = await (await api('api/sync')).json();
       if (!sync.configured) throw new Error('Turn on sync first (the Sync button on the library). The PC and the phone use it to find each other; the book itself goes straight over your Wi-Fi.');
@@ -125,7 +152,7 @@ const Sender = {
       await pc.setLocalDescription(await pc.createOffer());
       await Xfer.gathered(pc);
       if (!Xfer.hasCandidates(pc.localDescription.sdp)) {
-        throw Object.assign(new Error('This browser isn’t allowing direct connections (a privacy setting or extension may block them). Use the other way below.'), { other: true });
+        throw Object.assign(new Error(`This browser isn’t allowing direct connections (a privacy setting or extension may block them). ${this.otherWay()}`), { other: true });
       }
       const ips = ((await (await api('api/lan-ips')).json()).ips || []).slice(0, 3);
       const files = info.members.map((m) => ({ name: m.name, size: m.size }));
@@ -138,11 +165,11 @@ const Sender = {
       if (r.error) throw new Error(r.error);
       run.id = r.id;
       if (run.cancelled) { this.finish(run, false); return; }   // cancelled meanwhile: withdraw the offer
-      this.ui({ status: 'Waiting for your phone: open Read-Along on it (sync on, same Wi-Fi) and tap Receive.' });
+      this.ui({ status: 'Waiting for your phone: open Immersive Reader on it (sync on, same Wi-Fi) and tap Receive.' });
       const ans = await this.waitAnswer(run);
-      if (!ans) return;                                         // cancelled
+      if (!ans || this.run !== run) return;                     // cancelled (the window may show a newer attempt now)
       if (ans.declined) {
-        this.ui({ status: ans.reason || 'Your phone said “Not now”.', done: true, steps: false });
+        this.ui({ status: (ans.reason || 'Your phone said “Not now”.').replace(/Use the (other way below|code above)\./, this.otherWay()), done: true, steps: false });
         return this.finish(run, false);
       }
       this.ui({ status: 'Connecting to your phone…', steps: false });
@@ -151,7 +178,7 @@ const Sender = {
         await Xfer.opened(dc, pc, 15000);
       } catch {
         const why = await Xfer.why(pc);
-        throw Object.assign(new Error(`Your PC and phone couldn’t connect directly. ${why || 'Some Wi-Fi networks keep devices apart.'} Use the other way below.`), { other: true });
+        throw Object.assign(new Error(`Your PC and phone couldn’t connect directly. ${why || 'Some Wi-Fi networks keep devices apart.'} ${this.otherWay()}`), { other: true });
       }
       await this.send(run, dc, info);
       this.ui({ status: `Done: “${book.title}” is on your phone now.`, pct: 100, detail: Xfer.size(info.size), done: true });
@@ -169,12 +196,13 @@ const Sender = {
       await Xfer.sleep(1500);
       let a;
       try { a = await (await api('api/transfer?id=' + encodeURIComponent(run.id))).json(); } catch { continue; }
+      if (run.cancelled) return null;
       if (a.error) continue;                                    // e.g. no internet for a moment
       if (a.answer || a.declined) return a;
     }
     if (!run.cancelled) {
-      throw Object.assign(new Error('No answer from your phone. Check that the Read-Along app on the phone is open (on its library), '
-        + 'has sync on (Sync shows “In sync”), and is on the same Wi-Fi with internet, then try again. Or use the other way below.'), { other: true });
+      throw Object.assign(new Error('No answer from your phone. Check that the Immersive Reader app on the phone is open (on its library), '
+        + `has sync on (Sync shows “In sync”), and is on the same Wi-Fi with internet, then try again. ${this.otherWay()}`), { other: true });
     }
     return null;
   },
@@ -191,7 +219,7 @@ const Sender = {
         if (m.t === 'ready') { ready = true; lastProgress = Date.now(); if (wake) wake(); }
         else if (m.t === 'ack') {
           stored = m.bytes; lastProgress = Date.now();
-          this.ui({ pct: (100 * stored) / total, detail: `${Xfer.size(stored)} of ${Xfer.size(total)}` });
+          if (this.run === run) this.ui({ pct: (100 * stored) / total, detail: `${Xfer.size(stored)} of ${Xfer.size(total)}` });
           if (wake) wake();
         } else if (m.t === 'stored') settle(resolve);
         else if (m.t === 'error') settle(reject, new Error(m.message || 'The phone could not store the book.'));
@@ -218,6 +246,7 @@ const Sender = {
         try {
           dc.send(JSON.stringify({ t: 'start', id: run.id, total, files: info.members.map((m) => ({ name: m.name, size: m.size })) }));
           await waitFor(() => ready);
+          if (!live()) return;
           let sent = 0;
           this.ui({ status: 'Sending… keep both apps open.', pct: 0, detail: `0 MB of ${Xfer.size(total)}` });
           for (const m of info.members) {
@@ -252,8 +281,11 @@ const Sender = {
   finish(run, ok) {
     if (run.pc) { try { run.pc.close(); } catch { /* ignore */ } }
     if (run.id) api('api/transfer', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Read-Along': '1' }, body: JSON.stringify({ cancel: run.id }) }).catch(() => {});
-    if (this.run === run) this.run = null;
-    if (ok) setTimeout(() => { if (!this.run) $('#send-dialog').hidden = true; }, 4000);
+    if (this.run !== run) return;                  // an earlier attempt that was cancelled: the window belongs to the current one
+    this.run = null;
+    $('#send-direct').hidden = false;
+    clearTimeout(this.closeTimer);
+    if (ok) this.closeTimer = setTimeout(() => { if (!this.run) $('#send-dialog').hidden = true; }, 4000);
   },
 
   cancel() {
@@ -265,7 +297,7 @@ const Sender = {
   // Esc / a tap outside the dialog: only closes it when nothing is going on (use Cancel to stop a transfer)
   dismiss() { if (!this.run) $('#send-dialog').hidden = true; },
 
-  // the other way: download the file on the phone (scan the code with the iPhone camera), then Add book
+  // the download code: scan it with the iPhone camera, then Add book in the app
   async showOther() {
     const box = $('#send-other');
     box.hidden = false;
@@ -274,16 +306,20 @@ const Sender = {
     try { st = await (await api('api/lan-ips')).json(); } catch { /* ignore */ }
     const qrEl = $('#send-qr');
     qrEl.innerHTML = '';
+    this.hasCode = false;
     if (st && st.listening && st.pairUrl && b && b.pack) {
       const url = st.pairUrl.replace('/?key=', b.pack + '?key=');      // http://<PC>:8765/books/<book>/<file>?key=…
       const qr = qrcode(0, 'L'); qr.addData(url); qr.make();
       qrEl.innerHTML = qr.createSvgTag({ cellSize: 4, margin: 2, scalable: true });
-      $('#send-other-steps').innerHTML = '<li>Point the <b>iPhone camera</b> at this code and tap the link: the book downloads (it stays on your Wi-Fi).</li>'
-        + '<li>In the Read-Along app tap <b>Add book</b> → <b>Choose file</b> → <b>Downloads</b>, and pick it.</li>';
-    } else {
-      $('#send-other-steps').innerHTML = '<li>Turn on <b>Use on phone</b> (library) so the phone can download from this PC, then try again; or</li>'
-        + '<li>On the phone, open the Wi-Fi version of Read-Along, tap ⓘ on the book → <b>Download for the phone app</b>, then in the Read-Along app tap <b>Add book</b> and pick it from Files.</li>';
+      $('#send-other-steps').innerHTML = '<li>Point the <b>iPhone camera</b> at this code and tap the link: the book downloads over your Wi-Fi.</li>'
+        + '<li>In the Immersive Reader app tap <b>Add book</b> → <b>Choose file</b>, and pick it where it was saved (<b>Downloads</b>, or <b>On My iPhone → Chrome</b>).</li>'
+        + '<li>Afterwards you can delete the downloaded file: the app keeps its own copy.</li>';
+      this.hasCode = true;
+    } else {                                     // (phone access is off: the phone can't download from this PC)
+      $('#send-other-steps').innerHTML = '<li>Turn on <b>Use on phone</b> (top right of the library), then open this window again: '
+        + 'a code for the iPhone camera appears here.</li>';
     }
+    qrEl.hidden = !this.hasCode;
   },
 };
 
@@ -338,7 +374,7 @@ const Receiver = {
   },
 
   answer(offer, obj) {
-    return GH.putJson(PhoneSync.cfg, 'contents/transfer/answer.json', { id: offer.id, ...obj }, 'Read-Along: phone answer');
+    return GH.putJson(PhoneSync.cfg, 'contents/transfer/answer.json', { id: offer.id, ...obj }, 'Immersive Reader: phone answer');
   },
 
   async decline(reason) {
@@ -366,7 +402,7 @@ const Receiver = {
     document.addEventListener('visibilitychange', relock);
     try {
       try { await Local.checkSpace(+offer.book.size || 0); } catch (e) {
-        await this.answer(offer, { declined: true, reason: 'There isn’t enough room for this book in Read-Along on the phone.' }).catch(() => {});
+        await this.answer(offer, { declined: true, reason: 'There isn’t enough room for this book in Immersive Reader on the phone.' }).catch(() => {});
         throw e;
       }
       halt();
@@ -377,7 +413,7 @@ const Receiver = {
       await pc.setLocalDescription(await pc.createAnswer()); halt();
       await Xfer.gathered(pc); halt();
       if (!Xfer.hasCandidates(pc.localDescription.sdp)) {
-        await this.answer(offer, { declined: true, reason: 'The phone isn’t allowing direct connections. Use the other way below.' }).catch(() => {});
+        await this.answer(offer, { declined: true, reason: 'The phone isn’t allowing direct connections. Use the code above.' }).catch(() => {});
         throw new Error('This phone isn’t allowing direct connections. The laptop shows another way to get the book.');
       }
       await this.answer(offer, { answer: { type: 'answer', sdp: pc.localDescription.sdp } });
@@ -387,12 +423,12 @@ const Receiver = {
       dc.binaryType = 'arraybuffer';
       await Xfer.opened(dc, pc, 20000).catch(() => { throw new Error('Couldn’t connect to your PC directly. The laptop shows another way to get the book.'); });
       halt();
-      this.status('Receiving… keep Read-Along open and the screen on.');
+      this.status('Receiving… keep Immersive Reader open and the screen on.');
       const meta = await this.store(dc, offer, run, (s) => { stage = s; });
       stage = null;                                  // stored: nothing to undo
       this.status('Done.');
       $('#receive-dialog').hidden = true;
-      if (!S.book) await showLibrary();              // (never interrupts a book that's open)
+      await libraryAfterChange(meta.id);             // offline.js (never interrupts another book that's open)
       toast(`“${meta.title}” is on this phone now and works offline.`, 4500);
     } catch (e) {
       if (stage) { try { await ImportSink.abort(stage); } catch { /* ignore */ } }
@@ -410,6 +446,7 @@ const Receiver = {
       document.removeEventListener('visibilitychange', relock);
       if (wake) { try { await wake.release(); } catch { /* ignore */ } }
       if (run.pc) { try { run.pc.close(); } catch { /* ignore */ } }
+      if (typeof updateAfterBusy === 'function') updateAfterBusy();
     }
   },
 
@@ -419,13 +456,13 @@ const Receiver = {
     return new Promise((resolve, reject) => {
       const id = offer.book.id;
       let stage = null, meta = null, file = null, parts = [], audio = null, fill = 0, n = 0;
-      let stored = 0, audioSize = 0, other = 0, total = 0, failed = false, done = false, lastMsg = Date.now();
+      let stored = 0, audioSize = 0, other = 0, total = 0, failed = false, done = false, finishing = false, lastMsg = Date.now();
       let q = Promise.resolve();
       const quiet = setInterval(() => {
         if (Date.now() - lastMsg > XFER_QUIET) fail(new Error('The transfer stopped (nothing arrived for 30 seconds). Keep both apps open and try again.'));
       }, 3000);
       const fail = (e) => {
-        if (failed || done) return;
+        if (failed || done || finishing) return;           // (switching the book over to the new copy isn't interrupted)
         failed = true;
         clearInterval(quiet);
         try { dc.send(JSON.stringify({ t: 'error', message: String((e && e.message) || e) })); } catch { /* ignore */ }
@@ -450,7 +487,11 @@ const Receiver = {
           let m; try { m = JSON.parse(e.data); } catch { return; }
           if (m.t === 'start') {
             total = +m.total || 0;
-            step(async () => { stage = await ImportSink.begin(id); onStage(stage); dc.send(JSON.stringify({ t: 'ready' })); });
+            step(async () => {
+              const s = await ImportSink.begin(id);             // (it may wait for a cleanup to finish)
+              if (failed) { await ImportSink.abort(s); return; }  // the receive ended meanwhile
+              stage = s; onStage(s); dc.send(JSON.stringify({ t: 'ready' }));
+            });
           } else if (m.t === 'file') {
             const size = +m.size;
             if (!(size >= 0) || size > 4e9) return fail(new Error('The PC sent something unexpected.'));
@@ -461,9 +502,10 @@ const Receiver = {
             step(async () => {
               if (!meta || meta.id !== id) throw new Error('The book details are missing from what was sent.');
               if (!audioSize || n * CHUNK < audioSize) throw new Error('Not all of the audio arrived.');
-              await ImportSink.finish(stage, meta, audioSize, other);
-              done = true;
+              finishing = true;
               clearInterval(quiet);
+              try { await ImportSink.finish(stage, meta, audioSize, other); } catch (e) { finishing = false; throw e; }
+              done = true;
               try { dc.send(JSON.stringify({ t: 'stored' })); } catch { /* ignore */ }
               resolve(meta);
             });
@@ -501,7 +543,7 @@ const Receiver = {
           }
         }
       };
-      dc.onclose = () => { if (!done) fail(new Error('The connection to your PC was lost. Keep Read-Along open and the screen on while it receives, and try again.')); };
+      dc.onclose = () => { if (!done) fail(new Error('The connection to your PC was lost. Keep Immersive Reader open and the screen on while it receives, and try again.')); };
     });
   },
 
@@ -524,10 +566,10 @@ const Receiver = {
 };
 
 // ---------------------------------------------------------------- wiring
-$('#info-send').addEventListener('click', () => { if (infoBook) { $('#info-dialog').hidden = true; Sender.start(infoBook); } });
+$('#info-send').addEventListener('click', () => { if (infoBook) { $('#info-dialog').hidden = true; Sender.open(infoBook); } });
 $('#send-cancel').addEventListener('click', () => Sender.cancel());
 $('#send-close').addEventListener('click', () => Sender.cancel());
-$('#send-otherbtn').addEventListener('click', () => Sender.showOther());
+$('#send-direct').addEventListener('click', () => { if (Sender.lastBook && !Sender.run) { $('#send-direct').hidden = true; Sender.start(Sender.lastBook); } });
 $('#recv-yes').addEventListener('click', () => Receiver.receive());
 $('#recv-no').addEventListener('click', () => Receiver.stop());
 Receiver.init();
