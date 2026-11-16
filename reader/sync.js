@@ -182,6 +182,14 @@ const GH = {
     if (r.status === 409 || r.status === 422) return null;            // changed meanwhile: re-read and merge again
     throw GH.fail(r, `saving ${id}`);
   },
+  // write a small JSON file (e.g. the answer to a 'Send to phone' offer)
+  async putJson(cfg, path, obj, message) {
+    const cur = await GH.call(cfg, 'GET', path, null, 10000);
+    const body = { message, content: b64enc(JSON.stringify(obj)) };
+    if (cur.status === 200 && cur.data && cur.data.sha) body.sha = cur.data.sha;
+    const r = await GH.call(cfg, 'PUT', path, body, 15000);
+    if (r.status !== 200 && r.status !== 201) throw GH.fail(r, 'answering the PC');
+  },
   async listBooks(cfg) {
     const r = await GH.call(cfg, 'GET', 'contents/books');
     if (r.status === 404) return {};
@@ -326,7 +334,7 @@ const PhoneSync = {
     const errors = [];
     const ids = new Set([...(await LocalDB.all('books')).map((b) => b.id), ...Object.keys(remote)]);
     for (const id of ids) {
-      if (!id || id.length > 120 || /[\\/:*?"<>|]/.test(id)) continue;
+      if (!id || id.length > 120 || /[\\/:*?"<>|]/.test(id) || id.startsWith('__')) continue;   // (__selftest__: a test's file)
       if (remote[id] && remote[id] === this.shas[id] && !this.dirty[id]) continue;
       try { await this.syncBook(id, true); } catch (e) { errors.push(e); }
     }
@@ -469,7 +477,7 @@ const SyncUI = {
         rows = ((await (await api('api/books')).json()) || []).map((b) => ({ title: b.title || b.id, pos: b.position, here: true }));
       }
       const place = (p) => (p && p.time > 0
-        ? `${p.chapter ? chapterLabel(p.chapter) + ' · ' : ''}${fmt(p.time)}${p.device ? ` · ${esc(p.device)}` : ''}${p.updated ? `, ${this.ago(p.updated)}` : ''}`
+        ? `${p.chapter ? esc(chapterLabel(String(p.chapter))) + ' · ' : ''}${esc(fmt(+p.time))}${p.device ? ` · ${esc(String(p.device))}` : ''}${p.updated ? `, ${esc(this.ago(+p.updated))}` : ''}`
         : 'Not started');
       box.innerHTML = '<h4>In sync</h4>' + rows.map((r) => `<div class="sb-row"><b>${esc(r.title)}</b><span>${place(r.pos)}${r.here ? '' : ' · not on this phone'}</span></div>`).join('');
       box.hidden = !rows.length;

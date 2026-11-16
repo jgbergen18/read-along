@@ -52,6 +52,7 @@ const LocalDB = {
   put(store, value, key) { return this.run(store, 'readwrite', (s) => (key === undefined ? s.put(value) : s.put(value, key))); },
   del(store, key) { return this.run(store, 'readwrite', (s) => s.delete(key)); },
   delPrefix(store, prefix) { return this.run(store, 'readwrite', (s) => s.delete(IDBKeyRange.bound(prefix, prefix + '\uffff'))); },
+  keys(store) { return this.run(store, 'readonly', (s) => s.getAllKeys()); },
 };
 
 // ---------------------------------------------------------------- the local "server"
@@ -81,7 +82,7 @@ const Local = {
 
   async fileUrls(id, book) {
     if (!this.urls[id]) {
-      const [epub, sync] = await Promise.all(['epub', 'sync'].map((k) => LocalDB.get('files', `${id}/${k}`)));
+      const [epub, sync] = await Promise.all([LocalDB.get('files', (book && book.epubKey) || `${id}/epub`), LocalDB.get('files', (book && book.syncKey) || `${id}/sync`)]);
       if (!epub || !sync || !book || !book.audioSize) return null;
       this.urls[id] = {
         epub: URL.createObjectURL(new Blob([epub], { type: 'application/epub+zip' })),
@@ -97,7 +98,8 @@ const Local = {
   async audioFallback(id) {
     const book = await LocalDB.get('books', id);
     const parts = [];
-    for (let n = 0; n * CHUNK < book.audioSize; n++) parts.push(await LocalDB.get('chunks', `${id}/audio/${n}`));
+    const key = book.audioKey || `${id}/audio/`;
+    for (let n = 0; n * CHUNK < book.audioSize; n++) parts.push(await LocalDB.get('chunks', key + n));
     const url = URL.createObjectURL(new Blob(parts, { type: 'audio/mp4' }));
     if (this.urls[id]) this.urls[id].audio = url;
     return url;
@@ -214,11 +216,40 @@ const Local = {
   },
 
   // returns true when some reading data couldn't be sent yet (no internet...): it is sent when possible
+  // space used by each book on this device, and an estimate of what still fits
+  async storageInfo() {
+    const books = [];
+    let booksBytes = 0;
+    for (const b of await LocalDB.all('books')) {
+      let size = b.bytes;
+      if (!size) {                                     // added by an older version: measure once, remember it
+        const [e, s] = await Promise.all([LocalDB.get('files', b.epubKey || `${b.id}/epub`), LocalDB.get('files', b.syncKey || `${b.id}/sync`)]);
+        size = (b.audioSize || 0) + ((e && e.byteLength) || 0) + ((s && s.byteLength) || 0);
+        try { await LocalDB.put('books', { ...b, bytes: size }); } catch { /* ignore */ }
+      }
+      books.push({ id: b.id, title: b.title, bytes: size });
+      booksBytes += size;
+    }
+    let usage = null, quota = null;
+    try { const est = await navigator.storage.estimate(); usage = est.usage; quota = est.quota; } catch { /* not available */ }
+    const free = usage != null && quota ? Math.max(0, quota - usage) : null;
+    return { books, booksBytes, usage, quota, free };
+  },
+  // refuse (with a clear reason) to add something that won't fit
+  async checkSpace(bytes) {
+    let info;
+    try { info = await this.storageInfo(); } catch { return; }
+    if (info.free != null && bytes > info.free * 0.95) {
+      throw new Error(`There isn’t enough room in Read-Along on this phone: this book needs ${sizeText(bytes)} and it can store about ${sizeText(info.free)} more. `
+        + 'Remove a book you’ve finished (ⓘ → Remove from this device) and try again.');
+    }
+  },
+
   async remove(id) {
     const syncing = PhoneSync.configured();
     const sent = await PhoneSync.forget(id);          // try to send what's new first
-    for (const k of ['epub', 'sync']) await LocalDB.del('files', `${id}/${k}`);
-    await LocalDB.delPrefix('chunks', `${id}/audio/`);
+    await LocalDB.delPrefix('files', `${id}/`);        // every copy of its book files and audio
+    await LocalDB.delPrefix('chunks', `${id}/`);
     await LocalDB.del('books', id);
     if (!syncing) await LocalDB.del('state', id);     // with sync on, its reading data stays in sync (and comes back with the book)
     const keep = syncing && !sent;
@@ -229,6 +260,26 @@ const Local = {
     return keep;
   },
 };
+
+// ---------------------------------------------------------------- storage indicator (phone library)
+const sizeText = (n) => (n >= 1e9 ? `${(n / 1073741824).toFixed(1)} GB` : `${Math.max(1, Math.round(n / 1048576))} MB`);
+async function renderStorage() {
+  const el = $('#storage');
+  if (!el || !OFFLINE) return;
+  let info;
+  try { info = await Local.storageInfo(); } catch { el.hidden = true; return; }
+  const n = info.books.length;
+  $('#storage-used').textContent = n ? `${n} book${n === 1 ? '' : 's'} on this phone · ${sizeText(info.booksBytes)}` : 'No books on this phone yet';
+  // (the browser only tells how much more Read-Along may store; the phone's own free space can be less)
+  $('#storage-free').textContent = info.free != null ? `room for up to ~${sizeText(info.free)} more` : '';
+  const low = info.free != null && info.free < 1.5e9;
+  el.classList.toggle('low', low);
+  $('#storage-low').hidden = !low || !n;
+  const share = info.free != null ? info.booksBytes / Math.max(1, info.booksBytes + info.free) : 0;
+  el.querySelector('.storage-bar i').style.width = `${Math.min(100, n ? Math.max(1.5, 100 * share) : 0).toFixed(1)}%`;
+  el.hidden = false;
+  return info;
+}
 
 // ---------------------------------------------------------------- reading a .readalong file
 async function readStoredZip(file) {
@@ -277,33 +328,92 @@ async function readStoredZip(file) {
   return entries;
 }
 
+// storing a book on this device, piece by piece: used by "Add book" (a .readalong file) and by
+// receiving a book straight from the PC (transfer.js). The audio is kept in CHUNK-sized pieces.
+// The new copy is stored under its own keys next to any copy already there; finish() switches the book
+// over in one step (the book record says which keys it uses), then removes the old copy. So a transfer
+// or import that breaks off never costs the copy you had.
+const ImportSink = {
+  active: new Set(),                                                 // keys of copies being stored right now
+  async begin(id) {
+    if (navigator.storage && navigator.storage.persist) { try { await navigator.storage.persist(); } catch { /* ignore */ } }
+    const gen = Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+    const s = { id, audioKey: `${id}/audio@${gen}/`, epubKey: `${id}/epub@${gen}`, syncKey: `${id}/sync@${gen}` };
+    this.active.add(s.audioKey);
+    return s;
+  },
+  putFile(s, kind, buf) { return LocalDB.put('files', buf, kind === 'epub' ? s.epubKey : s.syncKey); },
+  putAudio(s, n, buf) { return LocalDB.put('chunks', buf, s.audioKey + n); },
+  async finish(s, meta, audioSize, otherBytes) {
+    const old = await LocalDB.get('books', s.id);
+    await LocalDB.put('books', {
+      audioSize, audioType: 'audio/mp4', bytes: audioSize + (otherBytes || 0),
+      audioKey: s.audioKey, epubKey: s.epubKey, syncKey: s.syncKey,
+      id: meta.id, title: meta.title, author: meta.author || null, year: meta.year || null, description: meta.description || null,
+      series: meta.series || null, seriesIndex: meta.seriesIndex ?? null, duration: meta.duration || null,
+      syncMode: meta.syncMode || 'dense', added: Date.now(),
+    });
+    this.active.delete(s.audioKey);
+    if (old) {                                                       // the copy it replaces
+      const oldAudio = old.audioKey || `${s.id}/audio/`;
+      if (oldAudio !== s.audioKey) await LocalDB.delPrefix('chunks', oldAudio);
+      for (const k of [old.epubKey || `${s.id}/epub`, old.syncKey || `${s.id}/sync`]) if (k !== s.epubKey && k !== s.syncKey) await LocalDB.del('files', k);
+    }
+    const u = Local.urls[s.id];
+    if (u) Object.values(u).forEach((x) => { if (String(x).startsWith('blob:')) URL.revokeObjectURL(x); });
+    delete Local.urls[s.id];
+    coverCache.delete(s.id);
+  },
+  // an import that didn't finish: remove what it stored so far (any copy that was there stays)
+  async abort(s) {
+    this.active.delete(s.audioKey);
+    await LocalDB.delPrefix('chunks', s.audioKey);
+    await LocalDB.del('files', s.epubKey);
+    await LocalDB.del('files', s.syncKey);
+  },
+  // copies left half-stored when the app was closed in the middle: free their space
+  async cleanup() {
+    const used = new Set();
+    for (const b of await LocalDB.all('books')) used.add(b.audioKey || `${b.id}/audio/`).add(b.epubKey || `${b.id}/epub`).add(b.syncKey || `${b.id}/sync`);
+    const stale = new Set();
+    for (const k of await LocalDB.keys('chunks')) {
+      const m = /^(.*\/audio@[^/]+\/)\d+$/.exec(String(k));
+      if (m && !used.has(m[1]) && !this.active.has(m[1])) stale.add(m[1]);
+    }
+    for (const p of stale) await LocalDB.delPrefix('chunks', p);
+    for (const k of await LocalDB.keys('files')) {
+      const m = /^(.*)\/(epub|sync)@([^/]+)$/.exec(String(k));
+      if (m && !used.has(String(k)) && !this.active.has(`${m[1]}/audio@${m[3]}/`)) await LocalDB.del('files', k);
+    }
+  },
+};
+
 async function importPack(file, onStatus) {
   onStatus('Reading the file…');
+  await Local.checkSpace(file.size);
   const z = await readStoredZip(file);
   for (const need of ['book.epub', 'audio.m4a', 'sync.json', 'meta.json']) {
     if (!z[need]) throw new Error(`This file is missing ${need}.`);
   }
   const meta = JSON.parse(await z['meta.json'].text());
   if (!meta.id || !meta.title) throw new Error('This file is missing the book details.');
-  if (navigator.storage && navigator.storage.persist) { try { await navigator.storage.persist(); } catch { /* ignore */ } }
   const audio = z['audio.m4a'];
   const mb = (audio.size / 1048576).toFixed(0);
-  await LocalDB.delPrefix('chunks', `${meta.id}/audio/`);            // replacing an older copy
-  await LocalDB.put('files', await z['book.epub'].arrayBuffer(), `${meta.id}/epub`);
-  await LocalDB.put('files', await z['sync.json'].arrayBuffer(), `${meta.id}/sync`);
-  const pieces = Math.ceil(audio.size / CHUNK);
-  for (let n = 0; n < pieces; n++) {
-    onStatus(`Saving “${meta.title}” to this device… ${Math.floor((100 * n) / pieces)}% of ${mb} MB. Keep this screen open.`);
-    await LocalDB.put('chunks', await audio.slice(n * CHUNK, (n + 1) * CHUNK).arrayBuffer(), `${meta.id}/audio/${n}`);
+  const stage = await ImportSink.begin(meta.id);
+  try {
+    const epubBuf = await z['book.epub'].arrayBuffer(), syncBuf = await z['sync.json'].arrayBuffer();
+    await ImportSink.putFile(stage, 'epub', epubBuf);
+    await ImportSink.putFile(stage, 'sync', syncBuf);
+    const pieces = Math.ceil(audio.size / CHUNK);
+    for (let n = 0; n < pieces; n++) {
+      onStatus(`Saving “${meta.title}” to this device… ${Math.floor((100 * n) / pieces)}% of ${mb} MB. Keep this screen open.`);
+      await ImportSink.putAudio(stage, n, await audio.slice(n * CHUNK, (n + 1) * CHUNK).arrayBuffer());
+    }
+    await ImportSink.finish(stage, meta, audio.size, epubBuf.byteLength + syncBuf.byteLength);
+  } catch (e) {
+    try { await ImportSink.abort(stage); } catch { /* ignore */ }
+    throw e;
   }
-  await LocalDB.put('books', {
-    audioSize: audio.size, audioType: 'audio/mp4',
-    id: meta.id, title: meta.title, author: meta.author || null, year: meta.year || null, description: meta.description || null,
-    series: meta.series || null, seriesIndex: meta.seriesIndex ?? null, duration: meta.duration || null,
-    syncMode: meta.syncMode || 'dense', added: Date.now(),
-  });
-  delete Local.urls[meta.id];
-  coverCache.delete(meta.id);
   return meta;
 }
 
@@ -327,7 +437,8 @@ if (OFFLINE) {
   if ('serviceWorker' in navigator) {
     const hadHelper = !!navigator.serviceWorker.controller;
     const ready = () => {
-      const calm = !S.book && ['#pack-dialog', '#info-dialog', '#sync-dialog'].every((s) => !$(s) || $(s).hidden);
+      const receiving = typeof Receiver !== 'undefined' && Receiver.busy;
+      const calm = !S.book && !receiving && ['#pack-dialog', '#info-dialog', '#sync-dialog', '#receive-dialog', '#send-dialog'].every((s) => !$(s) || $(s).hidden);
       if (calm) window.__switchToUpdate(); else window.__reloadForUpdate = true;
     };
     navigator.serviceWorker.addEventListener('controllerchange', () => { if (hadHelper) ready(); });   // (first visit: already newest)
@@ -407,8 +518,8 @@ if (OFFLINE) {
       toast(`“${meta.title}” is on this device now and works offline.`, 4500);
     } catch (e) {
       err.hidden = false;
-      err.textContent = e && e.name === 'QuotaExceededError'
-        ? 'There isn’t enough free space on this device for this book.'
+      err.textContent = e && (e.name === 'QuotaExceededError' || e.name === 'UnknownError')
+        ? 'The phone ran out of space for this book. Remove a book you’ve finished (ⓘ → Remove from this device) and try again.'
         : 'Could not add this book: ' + (e && e.message ? e.message : e);
     } finally {
       $('#pack-progress').hidden = true;
@@ -430,13 +541,9 @@ if (OFFLINE) {
     toast(kept ? 'Removed. Your latest progress and notes will be synced when there’s internet.' : 'Removed.', kept ? 4500 : 1800);
   });
 
-  // how much space the books take
-  window.addEventListener('DOMContentLoaded', async () => {
+  setTimeout(() => ImportSink.cleanup().catch(() => {}), 8000);      // half-stored copies from an interrupted import
+  window.addEventListener('DOMContentLoaded', () => {
     $('#shelf-empty').innerHTML = 'No books on this device yet. Tap <b>Add book</b> and choose a book’s <code>.readalong</code> file (made on your PC; it’s in the book’s folder).';
-    try {
-      const est = await navigator.storage.estimate();
-      if (est && est.usage > 5e6) $('#lib-sub').textContent = `Your books are stored on this device and work offline · ${(est.usage / 1073741824).toFixed(2)} GB used`;
-      else $('#lib-sub').textContent = 'Your books are stored on this device and work offline.';
-    } catch { /* ignore */ }
+    $('#lib-sub').textContent = 'Your books are stored on this phone and work offline.';
   });
 }

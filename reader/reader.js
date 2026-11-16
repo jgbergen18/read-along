@@ -86,7 +86,9 @@ async function api(url, opts) {
 // ================================================================ library
 async function showLibrary() {
   closeBook();
-  if (window.__reloadForUpdate && window.__switchToUpdate) { window.__switchToUpdate(); return; }   // phone app: a new version is ready
+  if (window.__reloadForUpdate && window.__switchToUpdate && !(typeof Receiver !== 'undefined' && Receiver.busy)) {
+    window.__switchToUpdate(); return;                         // phone app: a new version is ready
+  }
   document.body.classList.remove('immersive');
   $('#toast').hidden = true;
   $('#reader').hidden = true;
@@ -874,7 +876,7 @@ function onKey(e) {
   if (e.target && /^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName) && e.key !== 'Escape') return;
   if (e.key === 'Escape') {
     const modal = $$('.modal').find((m) => !m.hidden && m.id !== 'offline');
-    if (modal) { if (modal.id === 'sync-dialog') SyncUI.close(); else modal.hidden = true; return; }   // (closing it also turns the camera off)
+    if (modal) { closeModal(modal); return; }
     if (!$('#sel-menu').hidden) { Notes.hideMenu(); return; }
     if ($$('.panel').some((p) => !p.hidden)) { closePanels(); return; }
     if (S.book) showLibrary();
@@ -920,7 +922,15 @@ $('#btn-sleep').addEventListener('click', () => { updateSleepUI(); togglePanel('
 $('#sleep-choices').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) setSleep(b.dataset.sleep); });
 $$('[data-close]').forEach((b) => b.addEventListener('click', closePanels));
 $$('[data-close-modal]').forEach((b) => b.addEventListener('click', () => { b.closest('.modal').hidden = true; }));
-$$('.modal').forEach((m) => m.addEventListener('click', (e) => { if (e.target === m && m.id !== 'offline') m.hidden = true; }));
+$$('.modal').forEach((m) => m.addEventListener('click', (e) => { if (e.target === m && m.id !== 'offline') closeModal(m); }));
+// Esc or a tap outside a dialog: most just close; Sync also turns the camera off; a book transfer is only
+// stopped by its own buttons (and the phone's "Receive?" counts as "Not now")
+function closeModal(m) {
+  if (m.id === 'sync-dialog') SyncUI.close();
+  else if (m.id === 'receive-dialog' && typeof Receiver !== 'undefined') Receiver.dismiss();
+  else if (m.id === 'send-dialog' && typeof Sender !== 'undefined') Sender.dismiss();
+  else m.hidden = true;
+}
 $('#btn-phone').addEventListener('click', openPhone);
 $('#opt-lan').addEventListener('change', (e) => setPhone({ lan: e.target.checked }));
 $('#opt-startup').addEventListener('change', (e) => setPhone({ lan: true, startup: e.target.checked }));

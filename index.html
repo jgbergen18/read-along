@@ -60,6 +60,11 @@
         <button id="btn-phone" class="pill-btn" hidden><svg><use href="#i-phone"/></svg><span>Use on phone</span></button>
       </div>
     </header>
+    <div id="storage" class="storage" hidden>
+      <div class="storage-row"><span id="storage-used"></span><span id="storage-free"></span></div>
+      <div class="storage-bar"><i></i></div>
+      <p id="storage-low" class="tiny" hidden>Read-Along is close to how much it may store on this phone. Remove a book you’ve finished: ⓘ → <b>Remove from this device</b> (your progress and notes stay in sync).</p>
+    </div>
     <div id="stats" class="stats" hidden></div>
     <div id="jobs"></div>
     <div id="continue"></div>
@@ -271,7 +276,9 @@
             <button id="info-read" class="toggle on"><svg><use href="#i-play"/></svg><span>Read</span></button>
             <button id="info-restart" class="ghost">Start over</button>
             <button id="info-finished" class="ghost">Mark as finished</button>
+            <button id="info-send" class="ghost" hidden>Send to phone</button>
             <a id="info-pack" class="ghost" hidden download>Download for the phone app</a>
+            <button id="info-make-pack" class="ghost" hidden>Make the phone version</button>
             <button id="info-remove" class="ghost danger" hidden>Remove from this device</button>
           </div>
         </div>
@@ -284,7 +291,7 @@
     <div class="modal-card" role="dialog" aria-labelledby="add-h">
       <div class="panel-head"><strong id="add-h">Add a book</strong><button class="icon" data-close-modal aria-label="Close"><svg><use href="#i-close"/></svg></button></div>
       <div class="modal-body">
-        <p class="muted">Choose the book's <b>.epub</b> and its audiobook (<b>.m4b</b>). Read-Along copies them into your library, matches the chapters and syncs every word. That takes about 35 minutes; you can keep reading meanwhile.</p>
+        <p class="muted">Choose the book's <b>.epub</b> and its audiobook (<b>.m4b</b>). Read-Along copies them into your library, matches the chapters, syncs every word and makes the phone version. That takes about 45 minutes; you can keep reading meanwhile.</p>
         <div id="add-files" class="files"></div>
         <label class="ghost file-pick"><input id="add-input" type="file" accept=".epub,.m4b,.m4a" multiple hidden><svg><use href="#i-plus"/></svg><span>Choose files…</span></label>
         <div id="add-form" class="form" hidden>
@@ -296,6 +303,7 @@
           <p class="muted tiny">Folder: <code id="add-folder"></code></p>
         </div>
         <div id="add-progress" class="upload" hidden><div class="bar"><i id="add-bar"></i></div><span id="add-status" class="muted tiny"></span></div>
+        <p id="add-disk" class="muted tiny" hidden></p>
         <p id="add-error" class="error" hidden></p>
         <div class="row-end"><button id="add-go" class="toggle on" disabled>Add &amp; prepare</button></div>
       </div>
@@ -312,6 +320,42 @@
         <div id="pack-progress" class="upload" hidden><div class="bar indeterminate"><i></i></div></div>
         <p id="pack-status" class="muted tiny"></p>
         <p id="pack-error" class="error" hidden></p>
+      </div>
+    </div>
+  </div>
+
+  <div id="send-dialog" class="modal" hidden>
+    <div class="modal-card" role="dialog" aria-labelledby="send-h">
+      <div class="panel-head"><strong id="send-h">Send to your phone</strong><button class="icon" id="send-close" aria-label="Close"><svg><use href="#i-close"/></svg></button></div>
+      <div class="modal-body">
+        <p id="send-what"></p>
+        <ol id="send-steps" class="steps">
+          <li>On your iPhone, open <b>Read-Along</b> from the home screen, on its library (or with the book paused). It needs sync on and the same Wi-Fi as this PC.</li>
+          <li>Tap <b>Receive</b> when it asks. Keep it open with the screen on until it’s done (about a minute).</li>
+        </ol>
+        <p class="sync-status"><b>Status:</b> <span id="send-status"></span></p>
+        <div id="send-progress" class="upload" hidden><div class="bar"><i id="send-bar"></i></div><span id="send-pct" class="muted tiny"></span></div>
+        <p id="send-error" class="error" hidden></p>
+        <div id="send-other" class="send-other" hidden>
+          <p><b>The other way</b></p>
+          <div id="send-qr" class="qr"></div>
+          <ol id="send-other-steps" class="steps"></ol>
+        </div>
+        <div class="row-start"><button id="send-cancel" class="ghost">Cancel</button><button id="send-otherbtn" class="ghost">Other ways</button></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="receive-dialog" class="modal" hidden>
+    <div class="modal-card" role="dialog" aria-labelledby="recv-h">
+      <div class="panel-head"><strong id="recv-h">A book from your PC</strong></div>
+      <div class="modal-body">
+        <p id="recv-what"></p>
+        <p class="muted tiny">It comes straight over your Wi-Fi. Keep Read-Along open and the screen on until it’s done.</p>
+        <div id="recv-progress" class="upload" hidden><div class="bar"><i id="recv-bar"></i></div><span id="recv-pct" class="muted tiny"></span></div>
+        <p class="sync-status tiny"><span id="recv-status"></span></p>
+        <p id="recv-error" class="error" hidden></p>
+        <div class="row-end"><button id="recv-no" class="ghost">Not now</button><button id="recv-yes" class="toggle on">Receive</button></div>
       </div>
     </div>
   </div>
@@ -403,5 +447,6 @@
   <script src="reader/library-ui.js"></script>
   <script src="reader/offline.js"></script>
   <script src="reader/sync.js"></script>
+  <script src="reader/transfer.js"></script>
 </body>
 </html>

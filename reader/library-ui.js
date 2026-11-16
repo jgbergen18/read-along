@@ -19,10 +19,14 @@ const progressOf = (b) => {
 };
 
 let jobsCache = [];
+// books that can't be opened yet: being prepared (making the phone version doesn't count: the book can be read)
+const blocks = (j) => (j.state === 'queued' || j.state === 'running') && !j.phoneOnly && j.stage !== 'Making the phone version';
+const blockingJobs = (jobs) => new Set(jobs.filter(blocks).map((j) => j.folder));
 
 function renderLibrary(books, stats) {
   renderStats(stats);
-  const jobFolders = new Set(jobsCache.filter((j) => j.state === 'queued' || j.state === 'running').map((j) => j.folder));
+  if (OFFLINE) renderStorage();                 // offline.js: space used on the phone
+  const jobFolders = blockingJobs(jobsCache);
 
   // ---------------- continue / up next
   const cont = $('#continue');
@@ -157,9 +161,23 @@ function showInfo(b) {
   $('#info-read').querySelector('span').textContent = pr.pct > 0.2 && !b.finished ? 'Continue' : 'Read';
   $('#info-finished').textContent = b.finished ? 'Mark as not finished' : 'Mark as finished';
   $('#info-restart').hidden = !(pr.pct > 0.2 || b.finished);
+  $('#info-send').hidden = !(typeof Sender !== 'undefined' && Sender.available() && b.pack);
   const pack = $('#info-pack');
   pack.hidden = OFFLINE || !b.pack;
   if (b.pack) { pack.href = b.pack; pack.setAttribute('download', decodeURIComponent(b.pack.split('/').pop())); }
+  // laptop: books prepared before the phone version was part of it can get one here
+  const making = jobsCache.some((j) => j.folder === b.id && (j.state === 'running' || j.state === 'queued'));
+  const mk = $('#info-make-pack');
+  mk.hidden = !isLocal || OFFLINE || !!b.pack || !(b.syncInfo && b.syncInfo.complete) || making;
+  if (!OFFLINE && b.pack && b.packSize) {
+    $('#info-facts').insertAdjacentHTML('beforeend', `<span>Phone version: ${Math.round(b.packSize / 1048576)} MB</span>`);
+  }
+  if (OFFLINE) {                                 // how much space this book takes on the phone
+    Local.storageInfo().then((info) => {
+      const me = info.books.find((x) => x.id === b.id);
+      if (me && infoBook === b) $('#info-facts').insertAdjacentHTML('beforeend', `<span>${esc(sizeText(me.bytes))} on this phone</span>`);
+    }).catch(() => {});
+  }
   const cov = $('#info-cover');
   cov.innerHTML = '<div class="ph"></div>';
   cov.querySelector('.ph').textContent = b.title;
@@ -179,6 +197,15 @@ async function infoOp(op) {
 $('#info-read').addEventListener('click', () => { $('#info-dialog').hidden = true; if (infoBook) openBook(infoBook); });
 $('#info-restart').addEventListener('click', () => { if (confirm('Start this book from the beginning? Your bookmarks and highlights are kept.')) infoOp({ op: 'restart', device: deviceName() }); });
 $('#info-finished').addEventListener('click', () => infoOp({ op: 'finished', value: !(infoBook && infoBook.finished) }));
+$('#info-make-pack').addEventListener('click', async () => {
+  const b = infoBook; if (!b) return;
+  try {
+    await api('api/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Read-Along': '1' }, body: JSON.stringify({ folder: b.id, phoneOnly: true }) });
+    $('#info-dialog').hidden = true;
+    await showLibrary();                                        // (it hides messages, so the message comes after)
+    toast('Making the phone version. It takes a few minutes; you can keep reading.', 4500);
+  } catch { toast('Couldn’t start making the phone version.'); }
+});
 
 // ---------------- adding books
 const Add = { epub: null, audio: null, busy: false };
@@ -189,6 +216,7 @@ function openAdd(files) {
   $('#add-error').hidden = true;
   $('#add-progress').hidden = !Add.busy;
   $('#add-dialog').hidden = false;
+  showDisk();
   if (files) takeFiles(files);
   renderAdd();
 }
@@ -221,7 +249,22 @@ function addFolderName() {
   return (series && num ? `${series} ${num} - ${title}` : title).slice(0, 110).replace(/[ .]+$/, '');
 }
 
+// laptop: free disk space (a book needs room for its copies while it's prepared)
+let diskInfo = null;
+async function showDisk() {
+  try { diskInfo = await (await api('api/disk')).json(); } catch { diskInfo = null; }
+  renderAdd();
+}
+
 function renderAdd() {
+  const disk = $('#add-disk');
+  if (diskInfo && diskInfo.free != null) {
+    const need = Add.audio ? Add.audio.size * 3.3 + (Add.epub ? Add.epub.size * 2 : 0) + 2e8 : 0;
+    const gb = (n) => `${(n / 1073741824).toFixed(n < 1e10 ? 1 : 0)} GB`;
+    disk.hidden = false;
+    disk.textContent = `This PC has ${gb(diskInfo.free)} free.` + (need ? ` This book needs about ${gb(need)} while it’s prepared.` : '');
+    disk.classList.toggle('error', need > 0 && need > diskInfo.free * 0.9);
+  } else disk.hidden = true;
   const row = (f, kind) => `<div class="file ${f ? 'ok' : 'missing'}"><span class="k">${kind}</span><span>${f ? esc(f.name) + ` <span class="muted">(${(f.size / 1048576).toFixed(f.size > 1e8 ? 0 : 1)} MB)</span>` : 'not chosen yet'}</span></div>`;
   $('#add-files').innerHTML = row(Add.epub, 'Book (.epub)') + row(Add.audio, 'Audiobook (.m4b)');
   $('#add-form').hidden = !Add.epub;
@@ -230,7 +273,8 @@ function renderAdd() {
   const exists = (S.books || []).some((b) => b.id.toLowerCase() === folder.toLowerCase());
   const err = $('#add-error');
   if (exists && !Add.busy) { err.hidden = false; err.textContent = 'You already have a book with this name. Change the title or series.'; } else if (!Add.busy) err.hidden = true;
-  $('#add-go').disabled = Add.busy || !Add.epub || !Add.audio || !folder || exists;
+  const tooBig = !!(diskInfo && diskInfo.free != null && Add.audio && Add.audio.size * 2.2 > diskInfo.free);   // surely won't fit
+  $('#add-go').disabled = Add.busy || !Add.epub || !Add.audio || !folder || exists || tooBig;
 }
 
 function upload(file, folder, onProgress) {
@@ -265,8 +309,8 @@ async function startAdd() {
     await api('api/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Read-Along': '1' }, body: JSON.stringify({ folder }) });
     Add.busy = false;
     $('#add-dialog').hidden = true;
+    await showLibrary();
     toast('Added! It\'s being prepared in the background; you can keep reading.', 5000);
-    showLibrary();
   } catch (e) {
     Add.busy = false;
     const err = $('#add-error'); err.hidden = false; err.textContent = 'Something went wrong: ' + e.message;
@@ -281,16 +325,29 @@ async function pollJobs() {
   let jobs;
   try { jobs = await (await fetch('api/jobs', { cache: 'no-store' })).json(); } catch { return; }
   const wasRunning = new Set(jobsCache.filter((j) => j.state === 'running' || j.state === 'queued').map((j) => j.folder));
+  const wasBlocking = blockingJobs(jobsCache);
   jobsCache = jobs;
   const el = $('#jobs');
   el.innerHTML = jobs.map((j) => `
     <div class="job ${j.state}">
-      <div class="job-head"><b>${esc(((S.books || []).find((b) => b.id === j.folder) || {}).title || j.folder)}</b><span class="muted">${j.state === 'queued' ? 'Waiting for the current book to finish' : j.state === 'error' ? 'Could not be prepared' : j.state === 'done' ? 'Ready to read ✓' : esc(j.stage)}</span></div>
+      <div class="job-head"><b>${esc(((S.books || []).find((b) => b.id === j.folder) || {}).title || j.folder)}</b><span class="muted">${j.state === 'queued' ? 'Waiting for the current book to finish' : j.state === 'error' ? (j.phoneOnly ? 'The phone version couldn’t be made' : 'Could not be prepared') : j.state === 'done' ? (j.phoneOnly ? 'Phone version ready ✓' : 'Ready to read ✓') : esc(j.stage)}</span></div>
       ${j.state === 'running' || j.state === 'queued' ? `<div class="bar"><i style="width:${(100 * j.progress).toFixed(1)}%"></i></div>` : ''}
-      <div class="muted tiny">${esc(j.state === 'error' ? j.message : j.state === 'running' ? `${j.message || ''}${j.eta ? ` · about ${mins(j.eta)} left` : ''}` : '')}</div>
+      <div class="muted tiny">${esc(j.state === 'error' ? j.message : j.state === 'running' ? `${j.message || ''}${j.eta ? ` · about ${mins(j.eta)} left` : ''}` : j.warning || '')}</div>
     </div>`).join('');
-  const finishedNow = jobs.filter((j) => j.state === 'done' && wasRunning.has(j.folder));
-  if (finishedNow.length && !$('#library').hidden) { toast(`${finishedNow.map((j) => j.folder).join(', ')} is ready to read.`, 5000); showLibrary(); return; }
+  const finishedNow = jobs.filter((j) => (j.state === 'done' || j.state === 'error') && wasRunning.has(j.folder));
+  if (finishedNow.length && !$('#library').hidden) {
+    const names = (list) => list.map((j) => j.folder).join(', ');
+    const ok = finishedNow.filter((j) => j.state === 'done');
+    const phone = ok.filter((j) => j.phoneOnly), books = ok.filter((j) => !j.phoneOnly);
+    await showLibrary();                                       // (it hides messages, so the message comes after)
+    if (books.length) toast(books.some((j) => j.warning) ? `${names(books)} is ready to read (the phone version couldn’t be made yet).`
+      : `${names(books)} is ready to read, here and on the phone.`, 5000);
+    else if (phone.length) toast(`The phone version of ${names(phone)} is ready.`, 5000);
+    return;
+  }
+  // a book became readable (only its phone version is still being made): show it as ready right away
+  const nowBlocking = blockingJobs(jobs);
+  if ([...wasBlocking].some((f) => !nowBlocking.has(f)) && !$('#library').hidden) { await showLibrary(); return; }
   if (jobs.some((j) => j.state === 'running' || j.state === 'queued')) jobsTimer = setTimeout(pollJobs, 3000);
 }
 
