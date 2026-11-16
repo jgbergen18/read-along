@@ -123,6 +123,8 @@ async function loadCover(b, el) {
 
 // ================================================================ open / close
 async function openBook(meta) {
+  const my = S.openSeq = (S.openSeq || 0) + 1;      // a newer openBook/closeBook makes this one stop
+  const stale = () => my !== S.openSeq;
   S.meta = meta;
   S.audioReady = false;
   S.follow = true; S.lastW = -1; S.loc = null; S.hl = []; S.sections = new Map(); S.sleep = null;
@@ -136,21 +138,30 @@ async function openBook(meta) {
   updateFollowUI();
   let pos = store.get('pos:' + meta.id) || {};
   const shared = await Shared.load(meta.id);         // notes.js: state shared by all devices
+  if (stale()) return;
   const remote = shared && shared.position;
-  if (remote && (remote.updated || 0) > (pos.updated || 0) + 1000) {
-    pos = Object.assign(pos, { time: remote.time, cfi: remote.cfi || pos.cfi, updated: remote.updated });
-    if (remote.device && remote.device !== deviceName() && remote.time > 5) toast(`Picking up where you left off on ${remote.device}.`);
-  } else if (pos.time != null && pos.updated && (!remote || Math.abs((remote.time || 0) - pos.time) >= 2)) {
+  let catchUp = null;
+  // pos.moved = when this device itself last moved the place (by listening or jumping). Places saved by
+  // older versions have no such time (they were re-stamped just for being open), so the synced place wins.
+  if (remote && remote.time != null && (remote.updated || 0) > (pos.moved || 0) + 1000) {
+    pos = Object.assign(pos, { time: remote.time, cfi: remote.cfi || pos.cfi, moved: remote.updated || 0 });
+    if (remote.device && !fromHere(remote) && remote.time > 5) toast(`Picking up where you left off on ${remote.device}.`);
+  } else if (pos.time != null && pos.moved && (!remote || Math.abs((remote.time || 0) - pos.time) >= 2)) {
     // this device has a newer place the others never got (e.g. closed before it was sent): send it now,
     // with the time it was really reached, so it never beats something newer from another device
-    Shared.send([{ op: 'position', time: pos.time, cfi: pos.cfi || null, dur: pos.dur || null, chapter: pos.chapter || null,
-      device: deviceName(), updated: pos.updated }]);
+    catchUp = { op: 'position', v: 2, from: myId, time: pos.time, cfi: pos.cfi || null, dur: pos.dur || null,
+      chapter: pos.chapter || null, device: deviceName(), updated: pos.moved };
   }
   Shared.resetPush(pos);
+  if (catchUp) Shared.unsent = catchUp;             // [14] sent by the next save, and again until it arrives
+  // the newest progress could not be fetched in time (slow connection): hold this device's place back until it is
+  const pull = OFFLINE ? PhoneSync.pulls[meta.id] : (shared && shared.syncPending ? new Promise((res) => setTimeout(res, 4000)) : null);
+  if (pull) Shared.holdUntil(pull);
   store.set('pos:' + meta.id, Object.assign(pos, { opened: Date.now() }));
 
   try {
     await loadSync();
+    if (stale()) return;
     S.book = ePub(meta.epub, { openAs: 'epub' });
     S.rendition = S.book.renderTo('viewer', {
       width: '100%', height: '100%', flow: 'paginated',
@@ -162,6 +173,7 @@ async function openBook(meta) {
     S.rendition.on('relocated', (loc) => { S.loc = loc; onRelocated(); });
     S.rendition.on('keydown', onKey);
     await S.book.ready;
+    if (stale()) return;
     buildToc();
     Notes.attach();                                  // notes.js: highlights, selection menu
     S.book.coverUrl().then((u) => { S.coverUrl = u; setupMediaSession(); }).catch(() => {});
@@ -181,11 +193,13 @@ async function openBook(meta) {
       audio.addEventListener('loadedmetadata', done); audio.addEventListener('error', done);
       setTimeout(done, 15000);
     });
+    if (stale()) return;
     $('#scrub').max = String(Math.floor(audio.duration || 0));
     $('#t-dur').textContent = fmt(audio.duration);
     setupMediaSession();
-    if (pos.time != null) audio.currentTime = pos.time;
+    audio.currentTime = pos.time != null ? pos.time : 0;     // always explicit: never a place left from another book
   }
+  S.savedT = meta.audio ? (pos.time != null ? pos.time : 0) : null;    // where this window is; savePos compares with it
   S.audioReady = true;
 
   if (S.sync && meta.audio) {
@@ -194,6 +208,7 @@ async function openBook(meta) {
   } else {
     await S.rendition.display(pos.cfi || undefined);
   }
+  if (stale()) return;
   $('#loading').hidden = true;
   onTime();
   drawTicks();
@@ -206,6 +221,9 @@ async function openBook(meta) {
 }
 
 function closeBook() {
+  S.openSeq = (S.openSeq || 0) + 1;                  // a book still opening stops here
+  if (S.reloadDone) { audio.removeEventListener('loadedmetadata', S.reloadDone); S.reloadDone = null; }
+  S.reloadTo = null;
   if (!S.book) return;
   savePos();
   Shared.pushPosition(true);
@@ -216,7 +234,8 @@ function closeBook() {
   clearInterval(S.saveTimer); clearInterval(S.syncTimer); stopTick();
   S.sleep = null; audio.volume = 1;
   try { S.book.destroy(); } catch { /* ignore */ }
-  S.book = S.rendition = S.sync = null; S.at = S.aw = null; S.audioReady = false;
+  S.book = S.rendition = S.sync = null; S.at = S.aw = null; S.audioReady = false; S.savedT = null;
+  try { audio.currentTime = 0; } catch { /* clears a start position still pending from this book */ }
   $('#viewer').innerHTML = '';
   closePanels();
 }
@@ -227,13 +246,20 @@ function savePos() {
   if (S.meta.audio && !(S.audioReady && audio.readyState >= 1)) return;
   const prev = store.get('pos:' + S.meta.id) || {};
   const time = audio.src ? audio.currentTime : null;
-  // "updated" = when the place last changed (not just "still open"), so another device's newer place wins
-  const moved = time != null && (prev.time == null || Math.abs(time - prev.time) >= 1 || !prev.updated);
-  store.set('pos:' + S.meta.id, Object.assign(prev, {
-    time: time != null ? time : prev.time, dur: audio.duration || prev.dur || null,
-    cfi: S.loc && S.loc.start ? S.loc.start.cfi : prev.cfi, chapter: currentChapter(audio.currentTime).title || prev.chapter,
-    opened: Date.now(), ...(moved ? { updated: Date.now() } : {}),
-  }));
+  // "moved" = the place really changed in THIS window (listening or a jump), compared with where this window
+  // was, not with the saved place (another window of the app may have saved a newer one). Just being open
+  // is not a move, and then nothing but "still open" is written, so a forgotten window can't undo progress.
+  const moved = time != null && S.savedT != null && Math.abs(time - S.savedT) >= 1;
+  if (moved) {
+    S.savedT = time;
+    store.set('pos:' + S.meta.id, Object.assign(prev, {
+      time, dur: audio.duration || prev.dur || null,
+      cfi: S.loc && S.loc.start ? S.loc.start.cfi : prev.cfi, chapter: currentChapter(audio.currentTime).title || prev.chapter,
+      opened: Date.now(), moved: Date.now(),
+    }));
+  } else {
+    store.set('pos:' + S.meta.id, Object.assign(prev, { opened: Date.now() }));
+  }
   Shared.pushPosition(audio.paused);
 }
 
@@ -848,7 +874,7 @@ function onKey(e) {
   if (e.target && /^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName) && e.key !== 'Escape') return;
   if (e.key === 'Escape') {
     const modal = $$('.modal').find((m) => !m.hidden && m.id !== 'offline');
-    if (modal) { if (modal.id === 'sync-dialog') SyncUI.close(); else modal.hidden = true; return; }
+    if (modal) { if (modal.id === 'sync-dialog') SyncUI.close(); else modal.hidden = true; return; }   // (closing it also turns the camera off)
     if (!$('#sel-menu').hidden) { Notes.hideMenu(); return; }
     if ($$('.panel').some((p) => !p.hidden)) { closePanels(); return; }
     if (S.book) showLibrary();
@@ -904,14 +930,30 @@ $('#btn-retry').addEventListener('click', () => { $('#offline').hidden = true; i
 // reload the audio (e.g. after the PC was out of reach) without losing the place: a reload starts at 0
 function reloadAudio() {
   const id = S.meta.id;
-  const t = S.audioReady ? audio.currentTime : ((store.get('pos:' + id) || {}).time || 0);
+  if (S.reloadTo == null) S.reloadTo = S.audioReady ? audio.currentTime : ((store.get('pos:' + id) || {}).time || 0);
+  const wasPlaying = !audio.paused;
   S.audioReady = false;
-  audio.addEventListener('loadedmetadata', () => {
+  if (S.reloadDone) audio.removeEventListener('loadedmetadata', S.reloadDone);   // one reload at a time
+  S.reloadDone = () => {
+    S.reloadDone = null;
     if (!S.meta || S.meta.id !== id) return;          // another book was opened meanwhile
+    const t = S.reloadTo; S.reloadTo = null;
     if (t) audio.currentTime = t;
+    audioLoaded();
     S.audioReady = true;
-  }, { once: true });
+    if (wasPlaying) audio.play().catch(() => {});
+  };
+  audio.addEventListener('loadedmetadata', S.reloadDone, { once: true });
   audio.load();
+  if (wasPlaying) audio.dispatchEvent(new Event('pause'));   // load() pauses without saying so: update the controls
+}
+// after the audio (re)loaded: speed, length, chapter marks, lock-screen info
+function audioLoaded() {
+  audio.playbackRate = settings.rate;
+  $('#speed').value = String(settings.rate);
+  $('#scrub').max = String(Math.floor(audio.duration || 0));
+  $('#t-dur').textContent = fmt(audio.duration);
+  try { drawTicks(); setupMediaSession(); } catch { /* ignore */ }
 }
 
 $('#speed').addEventListener('change', (e) => { settings.rate = +e.target.value; audio.playbackRate = settings.rate; saveSettings(); });
@@ -937,7 +979,7 @@ scrub.addEventListener('change', () => { scrubbing = false; audio.currentTime = 
 
 audio.addEventListener('timeupdate', onTime);
 audio.addEventListener('seeked', () => { S.lastW = -1; followAudio(true); updatePosition(); updateChapter(audio.currentTime); });
-audio.addEventListener('play', () => { $('#ico-play').hidden = true; $('#ico-pause').hidden = false; $('#btn-play').setAttribute('aria-label', 'Pause'); startTick(); updateFollowUI(); });
+audio.addEventListener('play', () => { $('#ico-play').hidden = true; $('#ico-pause').hidden = false; $('#btn-play').setAttribute('aria-label', 'Pause'); startTick(); updateFollowUI(); Shared.remindOffer(); });
 audio.addEventListener('pause', () => { $('#ico-play').hidden = false; $('#ico-pause').hidden = true; $('#btn-play').setAttribute('aria-label', 'Play'); stopTick(); savePos(); updateFollowUI(); });
 audio.addEventListener('ratechange', updatePosition);
 audio.addEventListener('waiting', () => $('#btn-play').classList.add('buffering'));

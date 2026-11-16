@@ -9,7 +9,9 @@
  *  - the Sync dialog for both: setup (laptop: paste a GitHub key; phone: scan the laptop's QR code).
  */
 const SYNC_API = 'https://api.github.com';
-const SYNC_QUIET = 20000, SYNC_MAX_DELAY = 120000, SYNC_PULL_EVERY = 300000;
+// changes are sent 20 s after the last one, right away when a reading session ends, and at least every
+// 5 minutes while you keep listening; news from the other devices is fetched every 5 minutes
+const SYNC_QUIET = 20000, SYNC_MAX_DELAY = 300000, SYNC_PULL_EVERY = 300000;
 
 // ================================================================ merge rules (mirror of syncer.py)
 // Must give exactly the same answers as syncer.py: only real (finite) numbers count, text compares by
@@ -206,6 +208,7 @@ const GH = {
 // ================================================================ phone (offline app) sync
 const PhoneSync = {
   cfg: null, shas: {}, dirty: {}, ver: {}, lastPull: 0, running: null, again: null, changed: false,
+  pulls: {},              // book id -> fetch of the newest progress still under way (opening a book)
   status: { lastSync: null, lastError: null, syncing: false },
 
   configured() { return !!(this.cfg && this.cfg.token && this.cfg.repo); },
@@ -250,26 +253,24 @@ const PhoneSync = {
       const errors = [];
       try {
         if (Local.pending.size) await Promise.allSettled([...Local.pending]);   // changes being saved this moment
+        let did = false;                                       // did this pass talk to GitHub at all?
         if (opts.pull || Date.now() - this.lastPull > SYNC_PULL_EVERY) {
+          did = true;
           try { await this.full(); } catch (e) { errors.push(e); }
         }
         const now = Date.now();
         const due = Object.entries(this.dirty)
           .filter(([, [first, last]]) => opts.force || now - last >= SYNC_QUIET || now - first >= SYNC_MAX_DELAY);
         const onDevice = new Set(due.length ? (await LocalDB.all('books')).map((b) => b.id) : []);
+        did = did || due.length > 0;
         for (const [id] of due) {
           try {
-            if (!onDevice.has(id)) {                  // removed from this phone: send what's left, then let it go
-              if (!(await LocalDB.get('state', id))) { delete this.dirty[id]; continue; }
-              await this.syncBook(id, true);
-              if (!this.dirty[id]) await LocalDB.del('state', id);
-              continue;
-            }
-            await this.syncBook(id, true);
+            if (!onDevice.has(id) && !(await LocalDB.get('state', id))) { delete this.dirty[id]; continue; }
+            await this.syncBook(id, true);           // (also books no longer on this phone: their notes still sync)
           } catch (e) { errors.push(e); }
         }
         if (errors.length) throw errors[0];
-        this.status.lastSync = Date.now(); this.status.lastError = null;
+        if (did) { this.status.lastSync = Date.now(); this.status.lastError = null; }
       } catch (e) {
         this.status.lastError = GH.friendly(e);
       } finally {
@@ -318,23 +319,29 @@ const PhoneSync = {
     throw new Error(`could not save ${id}: it kept changing`);
   },
 
+  // every book in the repository (also ones not on this phone: their progress and listening time show
+  // here too, and are ready when the book is added) plus every book on this phone
   async full() {
     const remote = await GH.listBooks(this.cfg);
     const errors = [];
-    for (const b of await LocalDB.all('books')) {               // only books that are on this device
-      if (remote[b.id] && remote[b.id] === this.shas[b.id] && !this.dirty[b.id]) continue;
-      try { await this.syncBook(b.id, true); } catch (e) { errors.push(e); }
+    const ids = new Set([...(await LocalDB.all('books')).map((b) => b.id), ...Object.keys(remote)]);
+    for (const id of ids) {
+      if (!id || id.length > 120 || /[\\/:*?"<>|]/.test(id)) continue;
+      if (remote[id] && remote[id] === this.shas[id] && !this.dirty[id]) continue;
+      try { await this.syncBook(id, true); } catch (e) { errors.push(e); }
     }
     this.lastPull = Date.now();
     if (errors.length) throw errors[0];
   },
 
   // when a book is opened: get the newest progress quickly (best effort)
-  async pullBook(id, timeoutMs = 2500) {
+  // the fetch itself is never cut short: if it takes longer than waitMs, the book opens with what's on the
+  // phone, and the late answer still arrives (the reader then offers the newer place)
+  async pullBook(id, waitMs = 4000) {
     if (!this.configured() || !navigator.onLine) return;
-    try {
-      await Promise.race([this.syncBook(id, false, timeoutMs), new Promise((res) => setTimeout(res, timeoutMs + 300))]);
-    } catch { /* offline or slow: use what's on the phone */ }
+    const p = this.pulls[id] || (this.pulls[id] = this.syncBook(id, false, 30000).catch(() => {})
+      .then(() => { delete this.pulls[id]; }));
+    await Promise.race([p, new Promise((res) => setTimeout(res, waitMs))]);
   },
 
   async connect(code) {
@@ -352,7 +359,8 @@ const PhoneSync = {
     if (r.status !== 200) throw new Error(`This key can’t see ${cfg.repo} (GitHub answered ${r.status}).`);
     await LocalDB.put('meta', cfg, 'sync');
     this.cfg = cfg; this.shas = {}; this.lastPull = 0; this.status.lastError = null;
-    for (const b of await LocalDB.all('books')) this.mark(b.id);   // send what's on this phone too
+    for (const b of await LocalDB.all('books')) this.mark(b.id);   // send what's on this phone too,
+    for (const st of await LocalDB.all('state')) if (st && st.id) this.mark(st.id);   // and kept data of removed books
     await this.persist();
     await this.run({ force: true, pull: true });
     if (this.status.lastError) throw new Error(this.status.lastError);
@@ -365,19 +373,18 @@ const PhoneSync = {
     if (this.dirty[id] && navigator.onLine) {
       try { await Promise.race([this.syncBook(id, true, 8000), new Promise((res) => setTimeout(res, 9000))]); } catch { /* sent later */ }
     }
-    if (this.dirty[id]) return false;
-    delete this.shas[id]; delete this.ver[id];
-    await this.persist();
-    return true;
+    return !this.dirty[id];
   },
 
   async disconnect() {
     await LocalDB.del('meta', 'sync');
-    try {                                                      // reading data kept only to be sent: let it go
+    try {                     // reading data of books not on this phone came with sync: let it go, unless it was never sent
       const onDevice = new Set((await LocalDB.all('books')).map((b) => b.id));
-      for (const id of Object.keys(this.dirty)) if (!onDevice.has(id)) await LocalDB.del('state', id);
+      for (const st of await LocalDB.all('state')) {
+        if (st && st.id && !onDevice.has(st.id) && !this.dirty[st.id]) await LocalDB.del('state', st.id);
+      }
     } catch { /* ignore */ }
-    this.cfg = null; this.dirty = {}; this.shas = {};
+    this.cfg = null; this.shas = {};                           // (unsent changes stay marked: sent after reconnecting)
     this.status = { lastSync: null, lastError: null, syncing: false };
     await this.persist();
   },
@@ -439,6 +446,34 @@ const SyncUI = {
       clearTimeout(this.pollTimer);                            // while a pass runs, keep the status fresh
       if (st.syncing) this.pollTimer = setTimeout(async () => { await this.refreshLaptop(); this.render(); }, 2500);
     }
+    this.renderBooks();
+  },
+
+  // what's in sync: each book's latest place and where it came from
+  async renderBooks() {
+    const box = $('#sync-books');
+    const on = OFFLINE ? PhoneSync.configured() : !!(this.laptopInfo && this.laptopInfo.configured);
+    if (!box || !on || $('#sync-dialog').hidden) { if (box) box.hidden = true; return; }
+    if (this.booksBusy) return;
+    this.booksBusy = true;
+    try {
+      let rows;
+      if (OFFLINE) {
+        const here = await Local.books();
+        const ids = new Set(here.map((b) => b.id));
+        rows = here.map((b) => ({ title: b.title || b.id, pos: b.position, here: true }));
+        for (const st of await LocalDB.all('state')) {
+          if (st && st.id && !ids.has(st.id) && st.position) rows.push({ title: st.id, pos: st.position, here: false });
+        }
+      } else {
+        rows = ((await (await api('api/books')).json()) || []).map((b) => ({ title: b.title || b.id, pos: b.position, here: true }));
+      }
+      const place = (p) => (p && p.time > 0
+        ? `${p.chapter ? chapterLabel(p.chapter) + ' · ' : ''}${fmt(p.time)}${p.device ? ` · ${esc(p.device)}` : ''}${p.updated ? `, ${this.ago(p.updated)}` : ''}`
+        : 'Not started');
+      box.innerHTML = '<h4>In sync</h4>' + rows.map((r) => `<div class="sb-row"><b>${esc(r.title)}</b><span>${place(r.pos)}${r.here ? '' : ' · not on this phone'}</span></div>`).join('');
+      box.hidden = !rows.length;
+    } catch { /* ignore */ } finally { this.booksBusy = false; }
   },
 
   showError(msg) { const e = $('#sync-error'); e.hidden = !msg; e.textContent = msg || ''; },
@@ -486,27 +521,32 @@ const SyncUI = {
     if (this.scanning || this.starting) return;                // already on (or starting)
     this.showError('');
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { this.showError('This browser can’t use the camera here; paste the code instead.'); return; }
-    this.starting = true;
+    const attempt = {};                                        // this start; a Cancel/close (or a newer start) replaces it
+    this.starting = attempt;
     $('#sync-scan').disabled = true;
     const video = $('#sync-video');
     let stream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
     } catch {
-      this.starting = false; $('#sync-scan').disabled = false;
+      if (this.starting === attempt) { this.starting = null; $('#sync-scan').disabled = false; }
       this.showError('Camera access was refused. Allow camera access for Read-Along, or paste the code instead.');
       return;
     }
     // cancelled (or the dialog closed) while the camera was starting: turn it straight off again
-    const cancelled = () => !this.starting || $('#sync-dialog').hidden;
-    const drop = () => { stream.getTracks().forEach((t) => t.stop()); video.srcObject = null; $('#sync-scan').disabled = false; };
+    const cancelled = () => this.starting !== attempt || $('#sync-dialog').hidden;
+    const drop = () => {
+      stream.getTracks().forEach((t) => t.stop());
+      if (video.srcObject === stream) video.srcObject = null;
+      if (!this.starting && !this.scanning) $('#sync-scan').disabled = false;
+    };
     if (cancelled()) { drop(); return; }
     video.srcObject = stream;
     video.setAttribute('playsinline', '');
     video.muted = true;
     await video.play().catch(() => {});
     if (cancelled()) { drop(); return; }
-    this.starting = false;
+    this.starting = null;
     $('#sync-scan-box').hidden = false;
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
@@ -526,7 +566,7 @@ const SyncUI = {
     requestAnimationFrame(tick);
   },
   stopScan() {
-    this.starting = false;                                     // also cancels a camera that is still starting
+    this.starting = null;                                      // also cancels a camera that is still starting
     $('#sync-scan').disabled = false;
     const s = this.scanning;
     if (!s) return;

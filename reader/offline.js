@@ -125,11 +125,14 @@ const Local = {
 
   // changes being saved right now (a sync pass waits for them, so a change made as the app is left is sent)
   pending: new Set(),
+  seenListen: {},         // book id -> ids of listening-time reports already counted
   apply(id, ops) {
     const p = this.applyNow(id, ops);
     this.pending.add(p);
     const done = () => this.pending.delete(p);
     p.then(done, done);
+    // a reading session ended (pause, close, leaving the app): send it right away
+    if ((Array.isArray(ops) ? ops : [ops]).some((o) => o && o.op === 'flush')) p.then(() => PhoneSync.run({ force: true }), () => {});
     return p;
   },
 
@@ -144,28 +147,40 @@ const Local = {
         const k = op.op;
         if (k === 'position') {
           const pos = { time: op.time, cfi: op.cfi, dur: op.dur, chapter: op.chapter, device: op.device, updated: op.updated };
-          if (!st.position || (pos.updated || 0) >= (st.position.updated || 0)) st.position = pos;
-          if (op.dur && op.time >= op.dur - 90 && !st.finished) { st.finished = now; st.finishedUpdated = now; }
+          if (op.from) pos.from = op.from;
+          let applied = false;
+          if (!st.position || (pos.updated || 0) >= (st.position.updated || 0)) { st.position = pos; applied = true; }
+          if (applied && op.dur && op.time >= op.dur - 90 && !st.finished && (op.updated || 0) > (st.finishedUpdated || 0)) {
+            st.finished = now; st.finishedUpdated = now;
+          }
         } else if ((k === 'add' || k === 'update') && (op.kind === 'bookmarks' || op.kind === 'highlights')) {
           const item = op.item || {};
           if (!item.id) continue;
           const list = st[op.kind];
           const i = list.findIndex((x) => x.id === item.id);
-          const fresh = { ...item, created: item.created || now, updated: now };
-          if (i < 0) { if (k === 'add') list.push(fresh); }
-          else if (list[i].deleted) { if (k === 'add') list[i] = fresh; }   // editing something deleted elsewhere: skip
-          else list[i] = { ...list[i], ...item, updated: now };
+          // a change is stamped later than the version it replaces, even if this phone's clock is a little behind
+          const after = (x) => Math.max(now, ((x && x.updated) || 0) + 1);
+          if (i < 0) { if (k === 'add') list.push({ ...item, created: item.created || now, updated: now }); }
+          else if (list[i].deleted) { if (k === 'add') list[i] = { ...item, created: item.created || now, updated: after(list[i]) }; }   // editing something deleted elsewhere: skip
+          else list[i] = { ...list[i], ...item, updated: after(list[i]) };
         } else if (k === 'remove' && (op.kind === 'bookmarks' || op.kind === 'highlights')) {
-          st[op.kind] = st[op.kind].map((x) => (x.id === op.id ? { id: x.id, created: x.created || 0, deleted: true, updated: now } : x));
+          st[op.kind] = st[op.kind].map((x) => (x.id === op.id ? { id: x.id, created: x.created || 0, deleted: true, updated: Math.max(now, (x.updated || 0) + 1) } : x));
         } else if (k === 'listened') {
+          if (op.id) {                                // the same listening time sent again: count it once
+            const seen = this.seenListen[id] || (this.seenListen[id] = new Set());
+            if (seen.has(op.id)) continue;
+            seen.add(op.id);
+            if (seen.size > 500) seen.delete(seen.values().next().value);
+          }
           const day = String(op.date).slice(0, 10);
           const mine = st.listened[replica] || (st.listened[replica] = {});
           mine[day] = Math.round(((mine[day] || 0) + Math.max(0, Math.min(+op.seconds || 0, 3600))) * 10) / 10;
         } else if (k === 'finished') {
-          st.finished = op.value ? now : null; st.finishedUpdated = now;
+          const fu = Math.max(now, (st.finishedUpdated || 0) + 1);
+          st.finished = op.value ? fu : null; st.finishedUpdated = fu;
         } else if (k === 'restart') {
-          st.position = { time: 0, cfi: null, updated: now, device: op.device };
-          st.finished = null; st.finishedUpdated = now;
+          st.position = { time: 0, cfi: null, updated: Math.max(now, ((st.position && st.position.updated) || 0) + 1), device: op.device };
+          st.finished = null; st.finishedUpdated = Math.max(now, (st.finishedUpdated || 0) + 1);
         }
       }
       await this.saveRaw(id, st);
@@ -177,8 +192,9 @@ const Local = {
 
   async stats() {
     const perDay = {};
-    for (const b of await LocalDB.all('books')) {
-      for (const days of Object.values((await this.state(b.id)).listened)) {       // every device's listening time
+    const replica = await this.replica();
+    for (const raw of await LocalDB.all('state')) {       // every book in sync (also ones not on this phone)
+      for (const days of Object.values(SyncCore.normalize(raw, replica).listened)) {   // every device's listening time
         for (const [d, s] of Object.entries(days)) perDay[d] = (perDay[d] || 0) + s;
       }
     }
@@ -197,13 +213,15 @@ const Local = {
     };
   },
 
-  // returns true when reading data that hasn't been synced yet was kept (it is sent when possible)
+  // returns true when some reading data couldn't be sent yet (no internet...): it is sent when possible
   async remove(id) {
-    const keep = !(await PhoneSync.forget(id));       // unsent reading data stays until it has been sent
+    const syncing = PhoneSync.configured();
+    const sent = await PhoneSync.forget(id);          // try to send what's new first
     for (const k of ['epub', 'sync']) await LocalDB.del('files', `${id}/${k}`);
     await LocalDB.delPrefix('chunks', `${id}/audio/`);
     await LocalDB.del('books', id);
-    if (!keep) await LocalDB.del('state', id);
+    if (!syncing) await LocalDB.del('state', id);     // with sync on, its reading data stays in sync (and comes back with the book)
+    const keep = syncing && !sent;
     const u = this.urls[id];
     if (u) Object.values(u).forEach((x) => { if (x.startsWith('blob:')) URL.revokeObjectURL(x); });
     delete this.urls[id];
@@ -297,15 +315,36 @@ if (OFFLINE) {
   // at a calm moment, now if the library is showing with nothing open, else when you're back in the library
   window.__switchToUpdate = async () => {
     try { await Promise.allSettled([...Local.pending]); } catch { /* ignore */ }   // let saving finish first
+    try {            // the old helper may still be busy (audio of a book just closed): give it a moment to hand over
+      const reg = await navigator.serviceWorker.getRegistration();
+      if (reg && reg.waiting) {
+        await new Promise((res) => { navigator.serviceWorker.addEventListener('controllerchange', res, { once: true }); setTimeout(res, 3000); });
+      }
+    } catch { /* ignore */ }
+    try { sessionStorage.setItem('ra:updated-at', String(Date.now())); } catch { /* ignore */ }
     location.reload();
   };
   if ('serviceWorker' in navigator) {
     const hadHelper = !!navigator.serviceWorker.controller;
-    navigator.serviceWorker.addEventListener('controllerchange', () => {
-      if (!hadHelper) return;                                   // first visit: this page is the newest already
+    const ready = () => {
       const calm = !S.book && ['#pack-dialog', '#info-dialog', '#sync-dialog'].every((s) => !$(s) || $(s).hidden);
       if (calm) window.__switchToUpdate(); else window.__reloadForUpdate = true;
-    });
+    };
+    navigator.serviceWorker.addEventListener('controllerchange', () => { if (hadHelper) ready(); });   // (first visit: already newest)
+    // a new version is installed but still waiting (the old helper is busy, e.g. with the audio): same thing,
+    // but never reload for it twice in a row (if it keeps waiting, it takes over when the app is next opened)
+    navigator.serviceWorker.getRegistration().then((reg) => {
+      if (!reg) return;
+      const waitingReady = () => {
+        let last = 0;
+        try { last = +sessionStorage.getItem('ra:updated-at') || 0; } catch { /* ignore */ }
+        if (navigator.serviceWorker.controller && reg.waiting && Date.now() - last > 60000) ready();
+      };
+      const watch = (w) => { if (w) w.addEventListener('statechange', () => { if (w.state === 'installed') waitingReady(); }); };
+      waitingReady();
+      watch(reg.installing);
+      reg.addEventListener('updatefound', () => watch(reg.installing));
+    }).catch(() => {});
   }
   const viaNetwork = api;
   api = async function (url, opts = {}) {
@@ -337,6 +376,7 @@ if (OFFLINE) {
       audio.addEventListener('loadedmetadata', () => {
         if (!S.meta || S.meta.id !== id) return;
         if (t) audio.currentTime = t;
+        audioLoaded();                                // speed, length display
         S.audioReady = true;
       }, { once: true });
       audio.src = url;
@@ -363,8 +403,8 @@ if (OFFLINE) {
     try {
       const meta = await importPack(file, (t) => { status.textContent = t; });
       dlg.hidden = true;
+      await showLibrary();
       toast(`“${meta.title}” is on this device now and works offline.`, 4500);
-      showLibrary();
     } catch (e) {
       err.hidden = false;
       err.textContent = e && e.name === 'QuotaExceededError'
@@ -386,8 +426,8 @@ if (OFFLINE) {
       : `Remove “${infoBook.title}” from this device? Your bookmarks and notes for it are removed too.`)) return;
     const kept = await Local.remove(infoBook.id);
     $('#info-dialog').hidden = true;
+    await showLibrary();
     toast(kept ? 'Removed. Your latest progress and notes will be synced when there’s internet.' : 'Removed.', kept ? 4500 : 1800);
-    showLibrary();
   });
 
   // how much space the books take

@@ -150,6 +150,10 @@ a.ghost { text-decoration: none; color: inherit; }
 .scan-box { margin-top: 12px; display: grid; gap: 8px; justify-items: center; }
 .scan-box video { width: 100%; max-width: 360px; aspect-ratio: 1; object-fit: cover; border-radius: 12px; background: #000; }
 details.paste { margin-top: 14px; }
+.sync-books { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 10px; }
+.sync-books h4 { margin: 0 0 6px; font-size: 13px; color: var(--muted); font-weight: 600; }
+.sb-row { display: flex; flex-direction: column; gap: 1px; padding: 6px 0; font-size: 13px; }
+.sb-row span { color: var(--muted); }
 details.paste summary { cursor: pointer; color: var(--muted); }
 details.paste textarea { width: 100%; margin: 8px 0; border-radius: 10px; border: 1px solid var(--line); background: var(--bg); padding: 8px; font: 12px ui-monospace, Consolas, monospace; }
 #sync-dialog .steps ul { margin: 6px 0 0; padding-left: 18px; }

@@ -13,7 +13,7 @@ const lastActivity = (b) => Math.max((store.get('pos:' + b.id) || {}).opened || 
 const progressOf = (b) => {
   const local = store.get('pos:' + b.id) || {};
   const remote = b.position || {};
-  const pos = (remote.updated || 0) > (local.updated || 0) ? remote : local;
+  const pos = (remote.updated || 0) > (local.moved || 0) ? remote : local;    // this device's own place only if it moved there later
   const dur = b.duration || local.dur || remote.dur;
   return { time: pos.time || 0, dur, chapter: pos.chapter || local.chapter, pct: dur && pos.time ? Math.min(100, (100 * pos.time) / dur) : 0 };
 };

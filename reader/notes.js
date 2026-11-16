@@ -9,8 +9,15 @@
  */
 
 const deviceName = () => (isLocal ? 'your PC'
-  : /iPhone|iPad/.test(navigator.userAgent) ? 'your iPhone'
-    : /Android/.test(navigator.userAgent) ? 'your phone' : 'another device');
+  : /iPhone|iPad/.test(navigator.userAgent) ? (OFFLINE ? 'your iPhone app' : 'your iPhone')
+    : /Android/.test(navigator.userAgent) ? (OFFLINE ? 'your phone app' : 'your phone') : 'another device');
+// a random id for this window of the app, so a synced place can be recognised as this window's own
+// (two windows on one PC are told apart too: a forgotten window gets the 'Go there' offer, not the last word)
+const myId = (() => {
+  const make = () => Math.random().toString(36).slice(2, 10);
+  try { let v = sessionStorage.getItem('ra:winid'); if (!v) { v = make(); sessionStorage.setItem('ra:winid', v); } return v; } catch { return make(); }
+})();
+const fromHere = (p) => (p && p.from ? p.from === myId : !!p && p.device === deviceName());
 const today = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 // shorten text without cutting an emoji (or other 2-part character) in half
@@ -42,47 +49,90 @@ const Shared = {
   resetPush(pos) {
     this.lastPushT = pos && pos.time != null ? pos.time : -1;
     this.lastPushAt = 0;
-    this.lastMoveAt = (pos && pos.updated) || 0;
+    this.lastMoveAt = (pos && pos.moved) || 0;
+    this.openedWith = this.lastMoveAt;        // the place's time stamp when the book was opened
     this.offeredAt = 0;
+    this.pendingOffer = null;
+    this.hold = false;
     this.unsent = null;
+    this.unsentListen = [];
+  },
+  // the book was opened before the newest progress could be fetched (slow connection): don't send this
+  // device's place until it arrives, then offer the other device's place if it is newer
+  holdUntil(pending) {
+    this.hold = true;
+    const book = S.meta && S.meta.id;
+    const release = async () => {
+      if (!this.hold || !S.meta || S.meta.id !== book) return;
+      await this.refresh();
+      this.hold = false;
+      this.checkAhead(true);
+    };
+    Promise.resolve(pending).then(release, release);
+    setTimeout(release, 30000);               // never hold back for long
   },
   unsent: null,           // a place that could not be sent (no connection): sent again later, unchanged
+  unsentListen: [],       // listening-time reports that could not be sent: sent again as they were (counted once)
   pushPosition(force) {
-    if (!S.meta || !audio.getAttribute('src') || !S.audioReady || audio.readyState < 1) return;
+    if (!S.meta || !audio.getAttribute('src') || !S.audioReady || audio.readyState < 1 || this.hold) return;
     const t = audio.currentTime, now = Date.now();
     if (!force && now - this.lastPushAt < 15000) return;
     const ops = [];
     let posOp = null;
     if (Math.abs(t - this.lastPushT) >= 2) {
-      posOp = { op: 'position', time: t, cfi: S.loc && S.loc.start ? S.loc.start.cfi : null, dur: audio.duration || null,
-        chapter: currentChapter(t).title || null, device: deviceName(), updated: now };
-      this.lastPushT = t; this.lastMoveAt = now;
+      // stamped later than the place it replaces, even if this device's clock is a little behind
+      const stamp = Math.max(now, ((this.state && this.state.position && this.state.position.updated) || 0) + 1);
+      posOp = { op: 'position', v: 2, from: myId, time: t, cfi: S.loc && S.loc.start ? S.loc.start.cfi : null, dur: audio.duration || null,
+        chapter: currentChapter(t).title || null, device: deviceName(), updated: stamp };
+      this.lastPushT = t; this.lastMoveAt = stamp; this.pendingOffer = null;
     } else if (this.unsent) posOp = this.unsent;   // keeps its own time stamp, so it never beats newer news
     if (posOp) ops.push(posOp);
     const secs = this.listenAcc >= 1 ? Math.round(this.listenAcc) : 0;
-    if (secs) { ops.push({ op: 'listened', date: today(), seconds: secs }); this.listenAcc = 0; }
+    const listenOps = [...this.unsentListen];
+    if (secs) { listenOps.push({ op: 'listened', id: uid(), date: today(), seconds: secs }); this.listenAcc = 0; }
+    ops.push(...listenOps);
     if (!ops.length) return;
+    if (force && audio.paused) ops.push({ op: 'flush' });     // a reading session ended (pause, close, leave): sync it now
     this.lastPushAt = now;
     const book = S.meta.id;
     this.send(ops).then((r) => {
-      if (r) { if (posOp) this.unsent = null; return; }
+      if (r) {
+        if (posOp) this.unsent = null;
+        this.unsentListen = this.unsentListen.filter((x) => !listenOps.includes(x));
+        return;
+      }
       if (!S.meta || S.meta.id !== book) return;           // another book by now
       if (posOp && (!this.unsent || (this.unsent.updated || 0) <= posOp.updated)) this.unsent = posOp;
-      this.listenAcc += secs;
+      for (const x of listenOps) if (!this.unsentListen.includes(x)) this.unsentListen.push(x);
     });
   },
-  // another device got further while this one sat paused: offer to go there (never jump by itself)
-  checkAhead() {
+  // another device (or window) got further while this one sat paused: offer to go there (never jump by itself).
+  // afterPull: the newest progress arrived late (slow connection at open): also while playing, against the
+  // place the book was opened with
+  checkAhead(afterPull) {
     const r = this.state && this.state.position;
-    if (!r || !S.book || !audio.paused || !r.device || r.device === deviceName() || r.time == null) return;
+    if (!r || !S.book || (!audio.paused && !afterPull) || !r.device || fromHere(r) || r.time == null) return;
     const at = r.updated || 0;
-    if (at <= this.lastMoveAt + 1000 || at <= this.offeredAt || Math.abs(r.time - audio.currentTime) < 30) return;
+    const mine = afterPull ? Math.max(this.openedWith || 0, 0) : this.lastMoveAt;
+    if (at <= mine + 1000 || at <= this.offeredAt || Math.abs(r.time - audio.currentTime) < 30) return;
     this.offeredAt = at;
+    this.pendingOffer = { r, at };
+    this.showOffer();
+  },
+  showOffer() {
+    const o = this.pendingOffer;
+    if (!o || !S.book) return;
+    const { r, at } = o;
     const ch = chapterLabel(currentChapter(r.time).title || '');
     const what = r.time > audio.currentTime ? 'You got further on' : r.time < 5 ? 'You started over on' : 'You went back to an earlier place on';
     toast(`${what} ${r.device}${ch ? ` (${ch})` : ''}.`, 15000, {
-      label: 'Go there', run: () => { audio.currentTime = r.time; setFollow(true); this.lastPushT = r.time; this.lastMoveAt = at; },
+      label: 'Go there', run: () => { audio.currentTime = r.time; setFollow(true); this.lastPushT = r.time; this.lastMoveAt = at; this.pendingOffer = null; },
     });
+  },
+  // pressing play while an offer was missed: show it once more before this device's place takes over
+  remindOffer() {
+    const o = this.pendingOffer;
+    if (o && o.at > this.lastMoveAt + 1000 && !o.reminded) { o.reminded = true; this.showOffer(); }
   },
   tickListen() {                                   // wall-clock time spent listening
     const now = performance.now();
