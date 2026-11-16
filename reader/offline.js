@@ -292,6 +292,21 @@ async function importPack(file, onStatus) {
 // ---------------------------------------------------------------- wiring (offline mode only)
 if (OFFLINE) {
   document.body.classList.add('offline-app');
+
+  // a new version of the app arrived in the background (the offline helper updated itself): switch to it
+  // at a calm moment, now if the library is showing with nothing open, else when you're back in the library
+  window.__switchToUpdate = async () => {
+    try { await Promise.allSettled([...Local.pending]); } catch { /* ignore */ }   // let saving finish first
+    location.reload();
+  };
+  if ('serviceWorker' in navigator) {
+    const hadHelper = !!navigator.serviceWorker.controller;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (!hadHelper) return;                                   // first visit: this page is the newest already
+      const calm = !S.book && ['#pack-dialog', '#info-dialog', '#sync-dialog'].every((s) => !$(s) || $(s).hidden);
+      if (calm) window.__switchToUpdate(); else window.__reloadForUpdate = true;
+    });
+  }
   const viaNetwork = api;
   api = async function (url, opts = {}) {
     if (String(url).startsWith('blob:')) return viaNetwork(url, opts);

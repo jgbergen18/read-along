@@ -86,6 +86,7 @@ async function api(url, opts) {
 // ================================================================ library
 async function showLibrary() {
   closeBook();
+  if (window.__reloadForUpdate && window.__switchToUpdate) { window.__switchToUpdate(); return; }   // phone app: a new version is ready
   document.body.classList.remove('immersive');
   $('#toast').hidden = true;
   $('#reader').hidden = true;
