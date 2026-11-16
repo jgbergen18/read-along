@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Read-Along</title>
+  <meta name="theme-color" content="#fffdf9">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Read-Along">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <link rel="icon" href="reader/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="reader/apple-touch-icon.png">
+  <link rel="manifest" href="manifest.webmanifest" >
+  <script>window.READALONG_OFFLINE = true;
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');</script>
+  <link rel="stylesheet" href="reader/reader.css">
+  <link rel="stylesheet" href="reader/features.css">
+  <script src="reader/vendor/jszip.min.js"></script>
+  <script src="reader/vendor/epub.min.js"></script>
+  <script src="reader/vendor/qrcode.min.js"></script>
+</head>
+<body>
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <defs>
+      <symbol id="i-back" viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></symbol>
+      <symbol id="i-next" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></symbol>
+      <symbol id="i-list" viewBox="0 0 24 24"><path d="M5 7h14M5 12h14M5 17h9"/></symbol>
+      <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+      <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></symbol>
+      <symbol id="i-phone" viewBox="0 0 24 24"><rect x="7" y="2.5" width="10" height="19" rx="2.2"/><path d="M11 18.5h2"/></symbol>
+      <symbol id="i-here" viewBox="0 0 24 24"><path d="M4 5h9M4 9h9M4 13h6"/><path d="M15 12.5v7l5.5-3.5z" fill="currentColor"/></symbol>
+      <symbol id="i-follow" viewBox="0 0 24 24"><path d="M5 4h10a4 4 0 0 1 4 4v12l-4-3H5z"/><path d="M9 9.5h6M9 13h4"/></symbol>
+      <symbol id="i-bookmark" viewBox="0 0 24 24"><path d="M6.5 3.5h11v17l-5.5-4-5.5 4z"/></symbol>
+      <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6"/><path d="M15 15l5 5"/></symbol>
+      <symbol id="i-notes" viewBox="0 0 24 24"><path d="M5 4h14v16H5z"/><path d="M8.5 9h7M8.5 12.5h7M8.5 16h4"/></symbol>
+      <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+      <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.5"/></symbol>
+      <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" fill="currentColor" stroke="none"/></symbol>
+      <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a1 1 0 0 0-1-1H5a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h3"/></symbol>
+      <symbol id="i-pen" viewBox="0 0 24 24"><path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M13.5 6.5l4 4"/></symbol>
+      <symbol id="i-trash" viewBox="0 0 24 24"><path d="M5 7h14M10 7V4h4v3M7 7l1 13h8l1-13"/></symbol>
+      <symbol id="i-flame" viewBox="0 0 24 24"><path d="M12 21c-4 0-6.5-2.6-6.5-6.2 0-3.6 3-5.6 3.6-9.3 2.3 1.3 3.6 3.4 3.4 5.6 1-.6 1.8-1.7 2-3 2 1.8 3.5 4.1 3.5 6.7 0 3.6-2.5 6.2-6 6.2z"/></symbol>
+      <symbol id="i-aa" viewBox="0 0 24 24"><text x="2.5" y="17.5" font-size="14" font-family="Georgia, serif" stroke="none" fill="currentColor">Aa</text></symbol>
+    </defs>
+  </svg>
+
+  <!-- ============ Library ============ -->
+  <section id="library">
+    <header class="lib-head">
+      <div>
+        <h1>Read-Along</h1>
+        <p class="muted" id="lib-sub">Read along while the audiobook plays.</p>
+      </div>
+      <div class="head-actions">
+        <button id="btn-add" class="pill-btn" hidden><svg><use href="#i-plus"/></svg><span>Add book</span></button>
+        <button id="btn-phone" class="pill-btn" hidden><svg><use href="#i-phone"/></svg><span>Use on phone</span></button>
+      </div>
+    </header>
+    <div id="stats" class="stats" hidden></div>
+    <div id="jobs"></div>
+    <div id="continue"></div>
+    <div id="shelves"></div>
+    <p id="shelf-empty" class="muted" hidden>No books yet. Put each book's .epub and .m4b in its own folder inside <code>book aligner</code>, then run <code>aligner\align.bat</code>.</p>
+  </section>
+
+  <!-- ============ Reader ============ -->
+  <section id="reader" hidden>
+    <header class="topbar">
+      <button id="btn-back" class="icon" title="Library (Esc)" aria-label="Back to library"><svg><use href="#i-back"/></svg></button>
+      <div class="titles">
+        <div id="book-title" class="book-title"></div>
+        <div id="chapter-title" class="chapter-title muted"></div>
+      </div>
+      <span id="sync-pill" class="pill" hidden></span>
+      <button id="btn-bookmark" class="icon" title="Bookmark this page (B)" aria-label="Bookmark this page"><svg><use href="#i-bookmark"/></svg></button>
+      <button id="btn-search" class="icon" title="Search in book (/)" aria-label="Search in book"><svg><use href="#i-search"/></svg></button>
+      <button id="btn-notes" class="icon" title="Bookmarks &amp; highlights (N)" aria-label="Bookmarks and highlights"><svg><use href="#i-notes"/></svg></button>
+      <button id="btn-sleep" class="icon" title="Sleep timer" aria-label="Sleep timer"><svg><use href="#i-moon"/></svg><span id="sleep-badge" class="badge" hidden></span></button>
+      <button id="btn-toc" class="icon" title="Chapters (C)" aria-label="Chapters"><svg><use href="#i-list"/></svg></button>
+      <button id="btn-settings" class="icon" title="Reading settings" aria-label="Reading settings"><svg><use href="#i-aa"/></svg></button>
+    </header>
+
+    <div class="stage">
+      <button id="zone-prev" class="zone prev" aria-label="Previous page"><svg><use href="#i-back"/></svg></button>
+      <div id="viewer"></div>
+      <button id="zone-next" class="zone next" aria-label="Next page"><svg><use href="#i-next"/></svg></button>
+      <div id="loading" class="loading"><div class="spinner"></div><span>Opening book…</span></div>
+      <button id="return-chip" class="return-chip" hidden><svg><use href="#i-follow"/></svg><span>Back to narration</span></button>
+    </div>
+
+    <footer class="player">
+      <div class="row scrub-row">
+        <span id="t-cur" class="time">0:00:00</span>
+        <div class="scrub-wrap"><div id="ticks" class="ticks"></div><input id="scrub" type="range" min="0" max="1" step="1" value="0" aria-label="Audio position"></div>
+        <span id="t-dur" class="time">0:00:00</span>
+      </div>
+      <div class="row controls">
+        <div class="group left">
+          <select id="speed" title="Playback speed" aria-label="Playback speed">
+            <option value="0.8">0.8×</option><option value="0.9">0.9×</option><option value="1" selected>1×</option>
+            <option value="1.1">1.1×</option><option value="1.2">1.2×</option><option value="1.3">1.3×</option>
+            <option value="1.4">1.4×</option><option value="1.5">1.5×</option><option value="1.75">1.75×</option>
+            <option value="2">2×</option><option value="2.5">2.5×</option>
+          </select>
+        </div>
+        <div class="group center">
+          <button id="btn-back15" class="icon big" title="Back 15 s (J)" aria-label="Back 15 seconds">
+            <svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.3-5.6M4 4v4h4"/><text x="8.2" y="15.5" font-size="7" stroke="none" fill="currentColor">15</text></svg>
+          </button>
+          <button id="btn-play" class="play" title="Play / pause (Space)" aria-label="Play">
+            <svg id="ico-play" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" fill="currentColor" stroke="none"/></svg>
+            <svg id="ico-pause" viewBox="0 0 24 24" hidden><path d="M7 5h4v14H7zM13 5h4v14h-4z" fill="currentColor" stroke="none"/></svg>
+          </button>
+          <button id="btn-fwd30" class="icon big" title="Forward 30 s (L)" aria-label="Forward 30 seconds">
+            <svg viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.3-5.6M20 4v4h-4"/><text x="7.6" y="15.5" font-size="7" stroke="none" fill="currentColor">30</text></svg>
+          </button>
+        </div>
+        <div class="group right">
+          <button id="btn-follow" class="toggle on" title="Turn pages with the audio (F)"><svg><use href="#i-follow"/></svg><span>Following</span></button>
+          <button id="btn-here" class="ghost" title="Start the audio at the top of this page"><svg><use href="#i-here"/></svg><span>Read from here</span></button>
+        </div>
+      </div>
+    </footer>
+
+    <aside id="toc-panel" class="panel" hidden>
+      <div class="panel-head"><strong>Chapters</strong><button class="icon" data-close aria-label="Close"><svg><use href="#i-close"/></svg></button></div>
+      <nav id="toc"></nav>
+    </aside>
+
+    <aside id="notes-panel" class="panel" hidden>
+      <div class="panel-head"><div class="tabs"><button data-tab="bookmarks" class="on">Bookmarks</button><button data-tab="highlights">Highlights</button></div><button class="icon" data-close aria-label="Close"><svg><use href="#i-close"/></svg></button></div>
+      <div id="notes-list" class="list"></div>
+      <div class="panel-foot"><button id="btn-export" class="ghost small">Export notes</button><span class="muted tiny">Saved on your PC, shared with your phone.</span></div>
+    </aside>
+
+    <aside id="search-panel" class="panel" hidden>
+      <div class="panel-head"><input id="search-input" type="search" placeholder="Search this book" aria-label="Search this book" autocomplete="off"><button class="icon" data-close aria-label="Close"><svg><use href="#i-close"/></svg></button></div>
+      <div id="search-status" class="muted tiny search-status"></div>
+      <div id="search-results" class="list"></div>
+    </aside>
+
+    <aside id="sleep-panel" class="panel small" hidden>
+      <div class="panel-head"><strong>Sleep timer</strong><button class="icon" data-close aria-label="Close"><svg><use href="#i-close"/></svg></button></div>
+      <div class="choices" id="sleep-choices">
+        <button data-sleep="0">Off</button>
+        <button data-sleep="15">15 minutes</button>
+        <button data-sleep="30">30 minutes</button>
+        <button data-sleep="45">45 minutes</button>
+        <button data-sleep="60">1 hour</button>
+        <button data-sleep="chapter">End of this chapter</button>
+      </div>
+      <p id="sleep-status" class="muted tiny"></p>
+    </aside>
+
+    <aside id="settings-panel" class="panel small" hidden>
+      <div class="panel-head"><strong>Reading settings</strong><button class="icon" data-close aria-label="Close"><svg><use href="#i-close"/></svg></button></div>
+      <div class="settings-body">
+        <div class="setting">
+          <span>Text size</span>
+          <div class="seg"><button id="font-dn" aria-label="Smaller text">A−</button><span id="font-val">100%</span><button id="font-up" aria-label="Larger text">A+</button></div>
+        </div>
+        <div class="setting"><span>Theme</span>
+          <div class="seg" data-setting="theme"><button data-v="auto" title="Follow your device's light/dark setting">Auto</button><button data-v="light">Light</button><button data-v="sepia">Sepia</button><button data-v="dark">Dark</button></div>
+        </div>
+        <div class="setting"><span>Font</span>
+          <div class="seg" data-setting="fontFamily"><button data-v="book">Book</button><button data-v="serif">Serif</button><button data-v="sans">Sans</button></div>
+        </div>
+        <div class="setting"><span>Line spacing</span>
+          <div class="seg" data-setting="lineHeight"><button data-v="book">Book</button><button data-v="1.5">1.5</button><button data-v="1.75">1.75</button><button data-v="2">2</button></div>
+        </div>
+        <div class="setting desktop-only"><span>Page width</span>
+          <div class="seg" data-setting="width"><button data-v="narrow">Narrow</button><button data-v="normal">Normal</button><button data-v="wide">Wide</button></div>
+        </div>
+        <div class="setting"><span>Highlight</span>
+          <div class="seg" data-setting="highlight"><button data-v="off">Off</button><button data-v="word">Word</button><button data-v="phrase">Phrase</button></div>
+        </div>
+        <label class="setting check desktop-only"><input type="checkbox" id="opt-spread"> Two pages side by side on wide screens</label>
+        <p class="muted tiny keys desktop-only">Press <kbd>?</kbd> for keyboard shortcuts. Double-click any word to play from it.</p>
+      </div>
+    </aside>
+
+    <div id="sel-menu" class="sel-menu" hidden>
+      <button data-color="yellow" class="dot" style="--c:#f2d24b" aria-label="Highlight yellow"></button>
+      <button data-color="green" class="dot" style="--c:#8fd18b" aria-label="Highlight green"></button>
+      <button data-color="blue" class="dot" style="--c:#7fb6f0" aria-label="Highlight blue"></button>
+      <button data-color="pink" class="dot" style="--c:#f19ac0" aria-label="Highlight pink"></button>
+      <span class="sep"></span>
+      <button data-act="note" title="Add a note"><svg><use href="#i-pen"/></svg></button>
+      <button data-act="play" title="Play from here"><svg><use href="#i-play"/></svg></button>
+      <button data-act="copy" title="Copy"><svg><use href="#i-copy"/></svg></button>
+    </div>
+
+    <audio id="audio" preload="metadata"></audio>
+  </section>
+
+  <!-- ============ Phone pairing ============ -->
+  <div id="phone-dialog" class="modal" hidden>
+    <div class="modal-card" role="dialog" aria-labelledby="phone-h">
+      <div class="panel-head"><strong id="phone-h">Use Read-Along on your phone</strong><button class="icon" data-close-modal aria-label="Close"><svg><use href="#i-close"/></svg></button></div>
+      <div class="modal-body">
+        <label class="switch-row">
+          <span><b>Allow my phone to connect</b><br><span class="muted tiny">Over your home Wi-Fi. This PC must be on and awake.</span></span>
+          <input type="checkbox" id="opt-lan" class="switch">
+        </label>
+        <div id="phone-on" hidden>
+          <div class="qr-wrap">
+            <div id="qr" class="qr"></div>
+            <ol class="steps">
+              <li>Connect your phone to the <b>same Wi-Fi</b> as this PC.</li>
+              <li>Open the phone's <b>camera</b> and point it at the code, then tap the link.</li>
+              <li>Optional: use your browser's <b>Share → Add to Home Screen</b> to get an app icon.</li>
+            </ol>
+          </div>
+          <p class="muted tiny">Address: <code id="phone-url"></code>. The code includes a private key, so only phones you've paired can open your library.</p>
+          <div id="ip-row" class="ip-row" hidden>
+            <label for="ip-choice">Network address</label>
+            <select id="ip-choice"></select>
+            <span class="muted tiny">If the phone can't connect, pick your Wi-Fi's address here (it usually starts with 192.168). VPN and virtual-machine addresses won't work.</span>
+          </div>
+          <label class="setting check plain"><input type="checkbox" id="opt-startup"> Start with Windows, so the phone works even when Read-Along isn't open on the PC</label>
+          <p class="note">If Windows asks whether to let <b>Python</b> communicate on networks, choose <b>Private networks</b> and click <b>Allow</b>. Your phone can't connect until you do.</p>
+          <button id="btn-newkey" class="ghost small">Reset key (unpairs all phones)</button>
+        </div>
+        <p id="phone-error" class="error" hidden></p>
+      </div>
+    </div>
+  </div>
+
+  <div id="offline" class="modal" hidden>
+    <div class="modal-card small">
+      <div class="modal-body center">
+        <h3>Can't reach your PC</h3>
+        <p class="muted">Read-Along runs on your PC. Make sure it's on and awake, Read-Along is running, and this device is on the same Wi-Fi.</p>
+        <button id="btn-retry" class="toggle on">Try again</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="note-dialog" class="modal" hidden>
+    <div class="modal-card small" role="dialog" aria-labelledby="note-h">
+      <div class="panel-head"><strong id="note-h">Highlight</strong><button class="icon" data-close-modal aria-label="Close"><svg><use href="#i-close"/></svg></button></div>
+      <div class="modal-body">
+        <blockquote id="note-quote" class="quote"></blockquote>
+        <div class="color-row" id="note-colors">
+          <button data-color="yellow" class="dot" style="--c:#f2d24b" aria-label="Yellow"></button>
+          <button data-color="green" class="dot" style="--c:#8fd18b" aria-label="Green"></button>
+          <button data-color="blue" class="dot" style="--c:#7fb6f0" aria-label="Blue"></button>
+          <button data-color="pink" class="dot" style="--c:#f19ac0" aria-label="Pink"></button>
+        </div>
+        <textarea id="note-text" rows="4" placeholder="Add a note…"></textarea>
+        <div class="row-end"><button id="note-delete" class="ghost danger"><svg><use href="#i-trash"/></svg><span>Delete</span></button><button id="note-save" class="toggle on">Save</button></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="info-dialog" class="modal" hidden>
+    <div class="modal-card" role="dialog" aria-labelledby="info-title">
+      <div class="panel-head"><strong>About this book</strong><button class="icon" data-close-modal aria-label="Close"><svg><use href="#i-close"/></svg></button></div>
+      <div class="modal-body info">
+        <div id="info-cover" class="cover"></div>
+        <div>
+          <h3 id="info-title"></h3>
+          <div id="info-author" class="muted"></div>
+          <div id="info-facts" class="facts"></div>
+          <div class="bar"><i id="info-bar"></i></div>
+          <div class="info-actions">
+            <button id="info-read" class="toggle on"><svg><use href="#i-play"/></svg><span>Read</span></button>
+            <button id="info-restart" class="ghost">Start over</button>
+            <button id="info-finished" class="ghost">Mark as finished</button>
+            <a id="info-pack" class="ghost" hidden download>Download for the phone app</a>
+            <button id="info-remove" class="ghost danger" hidden>Remove from this device</button>
+          </div>
+        </div>
+        <p id="info-desc" class="desc"></p>
+      </div>
+    </div>
+  </div>
+
+  <div id="add-dialog" class="modal" hidden>
+    <div class="modal-card" role="dialog" aria-labelledby="add-h">
+      <div class="panel-head"><strong id="add-h">Add a book</strong><button class="icon" data-close-modal aria-label="Close"><svg><use href="#i-close"/></svg></button></div>
+      <div class="modal-body">
+        <p class="muted">Choose the book's <b>.epub</b> and its audiobook (<b>.m4b</b>). Read-Along copies them into your library, matches the chapters and syncs every word. That takes about 35 minutes; you can keep reading meanwhile.</p>
+        <div id="add-files" class="files"></div>
+        <label class="ghost file-pick"><input id="add-input" type="file" accept=".epub,.m4b,.m4a" multiple hidden><svg><use href="#i-plus"/></svg><span>Choose files…</span></label>
+        <div id="add-form" class="form" hidden>
+          <label>Title <input id="add-title" type="text"></label>
+          <div class="form-row">
+            <label>Series <span class="muted">(optional)</span> <input id="add-series" type="text" placeholder="Series name"></label>
+            <label class="num">Number <input id="add-num" type="number" min="0" step="0.5"></label>
+          </div>
+          <p class="muted tiny">Folder: <code id="add-folder"></code></p>
+        </div>
+        <div id="add-progress" class="upload" hidden><div class="bar"><i id="add-bar"></i></div><span id="add-status" class="muted tiny"></span></div>
+        <p id="add-error" class="error" hidden></p>
+        <div class="row-end"><button id="add-go" class="toggle on" disabled>Add &amp; prepare</button></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="pack-dialog" class="modal" hidden>
+    <div class="modal-card small" role="dialog" aria-labelledby="pack-h">
+      <div class="panel-head"><strong id="pack-h">Add a book</strong><button class="icon" data-close-modal aria-label="Close"><svg><use href="#i-close"/></svg></button></div>
+      <div class="modal-body">
+        <p>Choose the book's <b>.readalong</b> file. Your PC makes one for each book, in the book's folder (for example in OneDrive), and the laptop app's ⓘ book info can also download it.</p>
+        <p class="muted tiny">The book is copied onto this device, so it works without the PC and without internet. It takes a few hundred MB.</p>
+        <label id="pack-choose" class="toggle on file-pick"><input id="pack-input" type="file" hidden><svg><use href="#i-plus"/></svg><span>Choose file…</span></label>
+        <div id="pack-progress" class="upload" hidden><div class="bar indeterminate"><i></i></div></div>
+        <p id="pack-status" class="muted tiny"></p>
+        <p id="pack-error" class="error" hidden></p>
+      </div>
+    </div>
+  </div>
+
+  <div id="keys-dialog" class="modal" hidden>
+    <div class="modal-card small" role="dialog" aria-labelledby="keys-h">
+      <div class="panel-head"><strong id="keys-h">Keyboard shortcuts</strong><button class="icon" data-close-modal aria-label="Close"><svg><use href="#i-close"/></svg></button></div>
+      <div class="modal-body keys-grid">
+        <kbd>Space</kbd><span>Play / pause</span>
+        <kbd>← →</kbd><span>Turn page</span>
+        <kbd>J</kbd> <span>Back 15 seconds</span>
+        <kbd>L</kbd><span>Forward 30 seconds</span>
+        <kbd>F</kbd><span>Back to the narration</span>
+        <kbd>B</kbd><span>Bookmark this page</span>
+        <kbd>/</kbd><span>Search the book</span>
+        <kbd>N</kbd><span>Bookmarks &amp; highlights</span>
+        <kbd>C</kbd><span>Chapters</span>
+        <kbd>[ ]</kbd><span>Slower / faster</span>
+        <kbd>Esc</kbd><span>Close / back to library</span>
+        <span class="muted">Double-click</span><span>a word to play from it</span>
+        <span class="muted">Select text</span><span>to highlight, add a note or copy</span>
+      </div>
+    </div>
+  </div>
+
+  <div id="drop-zone" class="drop-zone" hidden><div>Drop the <b>.epub</b> and <b>.m4b</b> to add a book</div></div>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="reader/reader.js"></script>
+  <script src="reader/notes.js"></script>
+  <script src="reader/library-ui.js"></script>
+  <script src="reader/offline.js"></script>
+</body>
+</html>

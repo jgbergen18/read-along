@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#a8713a"/><stop offset="1" stop-color="#7a4b20"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#g)"/>
+  <!-- open book -->
+  <path d="M128 92c-18-14-44-20-74-18v104c30-2 56 4 74 18z" fill="#fbf4e6"/>
+  <path d="M128 92c18-14 44-20 74-18v104c-30-2-56 4-74 18z" fill="#f1e4c8"/>
+  <path d="M128 92v104" stroke="#7a4b20" stroke-width="5"/>
+  <!-- text lines (left page) -->
+  <g stroke="#c9a77a" stroke-width="6" stroke-linecap="round">
+    <path d="M70 102h40M70 122h40M70 142h40M70 162h28"/>
+  </g>
+  <!-- sound waves (right page) -->
+  <g fill="none" stroke="#a8713a" stroke-width="8" stroke-linecap="round">
+    <path d="M150 116a26 26 0 0 1 0 36"/>
+    <path d="M166 102a46 46 0 0 1 0 64"/>
+  </g>
+  <circle cx="146" cy="134" r="7" fill="#a8713a"/>
+</svg>

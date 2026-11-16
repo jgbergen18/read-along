@@ -1,0 +1,439 @@
+'use strict';
+/* Read-Along: things you keep while reading.
+ *  - Shared: reading state stored on the PC (position, bookmarks, highlights, listening time), so the
+ *    PC and paired phones all see the same thing
+ *  - Notes: bookmarks, highlights with notes, the selection menu, the notes panel and export
+ *  - playFromPoint: double-click a word to start the audio there
+ *  - Search: find text in the book and jump the reading + audio there
+ * Uses globals from reader.js (S, $, $$, audio, api, toast, settings, ...).
+ */
+
+const deviceName = () => (isLocal ? 'your PC'
+  : /iPhone|iPad/.test(navigator.userAgent) ? 'your iPhone'
+    : /Android/.test(navigator.userAgent) ? 'your phone' : 'another device');
+const today = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+const esc = (t) => String(t == null ? '' : t).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+// ================================================================ shared state
+const Shared = {
+  state: null, lastPushT: -1, lastPushAt: 0, listenAcc: 0, lastTick: 0,
+
+  async load(id) {
+    try { this.state = await (await api('api/state/' + encodeURIComponent(id))).json(); } catch { this.state = null; }
+    return this.state;
+  },
+  async send(ops) {
+    if (!S.meta) return null;
+    try {
+      const r = await api('api/state/' + encodeURIComponent(S.meta.id), {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Read-Along': '1' }, body: JSON.stringify(ops),
+      });
+      this.state = await r.json();
+      return this.state;
+    } catch { return null; }
+  },
+  pushPosition(force) {
+    if (!S.meta || !audio.getAttribute('src')) return;
+    const t = audio.currentTime, now = Date.now();
+    if (!force && (now - this.lastPushAt < 15000 || Math.abs(t - this.lastPushT) < 2)) return;
+    this.lastPushAt = now; this.lastPushT = t;
+    const ops = [{ op: 'position', time: t, cfi: S.loc && S.loc.start ? S.loc.start.cfi : null, dur: audio.duration || null,
+      chapter: currentChapter(t).title || null, device: deviceName(), updated: now }];
+    if (this.listenAcc >= 1) { ops.push({ op: 'listened', date: today(), seconds: Math.round(this.listenAcc) }); this.listenAcc = 0; }
+    this.send(ops);
+  },
+  tickListen() {                                   // wall-clock time spent listening
+    const now = performance.now();
+    if (!audio.paused && this.lastTick && now - this.lastTick < 2000) this.listenAcc += (now - this.lastTick) / 1000;
+    this.lastTick = now;
+  },
+};
+
+// ================================================================ bookmarks & highlights
+const HL_COLORS = { yellow: '#f2d24b', green: '#8fd18b', blue: '#7fb6f0', pink: '#f19ac0' };
+
+const Notes = {
+  drawn: [],
+  tab: 'bookmarks',
+  sel: null,              // { cfiRange, contents, text }
+  editing: null,
+
+  attach() {
+    S.rendition.on('selected', (cfiRange, contents) => this.onSelect(cfiRange, contents));
+    S.rendition.on('relocated', () => { this.hideMenu(); this.updateBookmarkBtn(); this.renderAll(); });
+    this.renderAll();
+  },
+
+  list(kind) { return (Shared.state && Shared.state[kind]) || []; },
+
+  // ---- drawing the reader's own highlights
+  boxes: [],
+  renderAll() {                                   // drawn as small boxes over the visible words (see Overlay)
+    if (!S.rendition) return;
+    const dark = effTheme() === 'dark';
+    this.boxes = Overlay.draw('user', this.list('highlights').map((h) => ({
+      cfi: h.cfi, color: HL_COLORS[h.color] || HL_COLORS.yellow, opacity: dark ? 0.32 : 0.42, data: h })));
+  },
+  draw() { this.renderAll(); },
+  // a tap/click at (clientX, clientY) inside a page: is it on one of your highlights?
+  hitAt(contents, clientX, clientY) {
+    const f = contents.window.frameElement.getBoundingClientRect(), st = $('.stage').getBoundingClientRect();
+    const x = f.left + clientX - st.left, y = f.top + clientY - st.top;
+    const b = this.boxes.find((q) => x >= q.x - 2 && x <= q.x + q.w + 2 && y >= q.y - 2 && y <= q.y + q.h + 2);
+    return b ? b.item.data : null;
+  },
+
+  // ---- where in the audio is a piece of text?
+  async place(cfi) {
+    const out = { word: null, time: null, chapter: null };
+    try {
+      const w = await wordAtCfi(cfi);
+      if (w != null) {
+        out.word = w;
+        if (S.sync) out.time = timeAt(w);
+        const ch = (S.sync && S.sync.chapters) || [];
+        for (const c of ch) { if (c.word <= w) out.chapter = c.title; else break; }
+      }
+    } catch { /* ignore */ }
+    return out;
+  },
+
+  // ---- selection menu
+  onSelect(cfiRange, contents) {
+    const selObj = contents.window.getSelection();
+    const text = String(selObj || '').trim();
+    if (!text) return this.hideMenu();
+    this.sel = { cfiRange, contents, text };
+    const r = selObj.getRangeAt(0).getBoundingClientRect();
+    const frame = contents.window.frameElement.getBoundingClientRect();
+    const menu = $('#sel-menu');
+    menu.hidden = false;
+    const mw = menu.offsetWidth, mh = menu.offsetHeight;
+    let x = frame.left + r.left + r.width / 2 - mw / 2;
+    let y = frame.top + r.top - mh - 10;
+    if (y < 60) y = frame.top + r.bottom + 10;
+    x = Math.max(8, Math.min(window.innerWidth - mw - 8, x));
+    menu.style.left = x + 'px';
+    menu.style.top = y + 'px';
+  },
+  hideMenu() { $('#sel-menu').hidden = true; this.sel = null; },
+  clearSelection() {
+    try { this.sel && this.sel.contents.window.getSelection().removeAllRanges(); } catch { /* ignore */ }
+    this.hideMenu();
+  },
+
+  async addHighlight(color, withNote) {
+    if (!this.sel) return;
+    const { cfiRange, text } = this.sel;
+    const where = await this.place(cfiRange);
+    const h = { id: uid(), cfi: cfiRange, text: text.slice(0, 2000), color, note: '', created: Date.now(), ...where };
+    this.clearSelection();
+    await Shared.send([{ op: 'add', kind: 'highlights', item: h }]);
+    this.draw(h);
+    if (withNote) this.edit(h);
+    else toast('Highlighted. Click it to add a note.', 1800);
+  },
+
+  async playSelection() {
+    if (!this.sel || !S.sync) return;
+    const where = await this.place(this.sel.cfiRange);
+    this.clearSelection();
+    if (where.time != null) playAt(where.time);
+  },
+
+  async copySelection() {
+    if (!this.sel) return;
+    const t = this.sel.text;
+    this.clearSelection();
+    try { await navigator.clipboard.writeText(t); toast('Copied.', 1200); } catch {
+      const ta = document.createElement('textarea'); ta.value = t; document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); toast('Copied.', 1200); } catch { /* ignore */ }
+      ta.remove();
+    }
+  },
+
+  // ---- note editor
+  edit(h) {
+    this.editing = h;
+    $('#note-quote').textContent = h.text;
+    $('#note-text').value = h.note || '';
+    $$('#note-colors .dot').forEach((d) => d.classList.toggle('on', d.dataset.color === (h.color || 'yellow')));
+    $('#note-dialog').hidden = false;
+    setTimeout(() => $('#note-text').focus(), 50);
+  },
+  async saveEdit() {
+    const h = this.editing; if (!h) return;
+    const color = ($('#note-colors .dot.on') || {}).dataset ? $('#note-colors .dot.on').dataset.color : h.color;
+    const item = { id: h.id, note: $('#note-text').value.trim(), color };
+    $('#note-dialog').hidden = true;
+    await Shared.send([{ op: 'update', kind: 'highlights', item }]);
+    this.renderAll();
+    if (!$('#notes-panel').hidden) this.renderPanel();
+  },
+  async deleteEdit() {
+    const h = this.editing; if (!h) return;
+    $('#note-dialog').hidden = true;
+    await Shared.send([{ op: 'remove', kind: 'highlights', id: h.id }]);
+    this.renderAll();
+    if (!$('#notes-panel').hidden) this.renderPanel();
+  },
+
+  // ---- bookmarks
+  pageBookmark() { return this.list('bookmarks').find((b) => onCurrentPage(b.cfi)); },
+  updateBookmarkBtn() {
+    const on = !!(S.book && this.pageBookmark());
+    const b = $('#btn-bookmark');
+    b.classList.toggle('active', on);
+    b.title = on ? 'Remove this bookmark (B)' : 'Bookmark this page (B)';
+  },
+  async toggleBookmark() {
+    if (!S.loc || !S.loc.start) return;
+    const existing = this.pageBookmark();
+    if (existing) {
+      await Shared.send([{ op: 'remove', kind: 'bookmarks', id: existing.id }]);
+      toast('Bookmark removed.', 1400);
+    } else {
+      const cfi = S.loc.start.cfi;
+      const where = await this.place(cfi);
+      let text = '';
+      try { text = (await S.book.getRange(S.loc.start.cfi + '')).toString(); } catch { /* ignore */ }
+      if (!text && where.word != null) text = await snippetAt(where.word, 18);
+      await Shared.send([{ op: 'add', kind: 'bookmarks', item: { id: uid(), cfi, text: text.slice(0, 300), created: Date.now(), ...where } }]);
+      toast('Bookmarked.', 1400);
+    }
+    this.updateBookmarkBtn();
+    if (!$('#notes-panel').hidden) this.renderPanel();
+  },
+
+  // ---- notes panel
+  openPanel(tab) {
+    if (tab) this.tab = tab;
+    closePanels();
+    $('#notes-panel').hidden = false;
+    this.renderPanel();
+  },
+  renderPanel() {
+    $$('#notes-panel .tabs button').forEach((b) => b.classList.toggle('on', b.dataset.tab === this.tab));
+    const items = this.list(this.tab).slice().sort((a, b) => (a.word ?? 1e12) - (b.word ?? 1e12));
+    const el = $('#notes-list');
+    if (!items.length) {
+      el.innerHTML = `<p class="empty muted">${this.tab === 'bookmarks'
+        ? 'No bookmarks yet. Press the ribbon button (or B) to bookmark the page you\'re on.'
+        : 'No highlights yet. Select some text to highlight it or add a note.'}</p>`;
+      return;
+    }
+    el.innerHTML = items.map((x) => `
+      <div class="item" data-id="${esc(x.id)}">
+        <button class="go">
+          <span class="meta">${esc(x.chapter ? chapterLabel(x.chapter) : '')}${x.time != null ? ' · ' + fmt(x.time) : ''}</span>
+          <span class="txt${this.tab === 'highlights' ? ' hl' : ''}" ${this.tab === 'highlights' ? `style="--c:${HL_COLORS[x.color] || HL_COLORS.yellow}"` : ''}>${esc((x.text || '').slice(0, 220))}${(x.text || '').length > 220 ? '…' : ''}</span>
+          ${x.note ? `<span class="note">${esc(x.note)}</span>` : ''}
+        </button>
+        <div class="acts">
+          ${this.tab === 'highlights' ? '<button class="icon edit" title="Edit note"><svg><use href="#i-pen"/></svg></button>' : ''}
+          <button class="icon del" title="Delete"><svg><use href="#i-trash"/></svg></button>
+        </div>
+      </div>`).join('');
+  },
+  async onPanelClick(e) {
+    const item = e.target.closest('.item'); if (!item) return;
+    const x = this.list(this.tab).find((i) => i.id === item.dataset.id); if (!x) return;
+    if (e.target.closest('.del')) {
+      await Shared.send([{ op: 'remove', kind: this.tab, id: x.id }]);
+      if (this.tab === 'highlights') this.renderAll();
+      this.updateBookmarkBtn();
+      this.renderPanel();
+    } else if (e.target.closest('.edit')) {
+      this.edit(x);
+    } else if (e.target.closest('.go')) {
+      closePanels();
+      if (x.time != null && S.sync && S.meta.audio) playAt(x.time, !audio.paused);
+      else { setFollow(false); await S.rendition.display(x.cfi); }
+    }
+  },
+
+  // ---- export everything as a Markdown file
+  exportMarkdown() {
+    const title = S.meta.title, author = S.meta.author || '';
+    const all = [...this.list('bookmarks').map((b) => ({ ...b, kind: 'bookmark' })), ...this.list('highlights').map((h) => ({ ...h, kind: 'highlight' }))]
+      .sort((a, b) => (a.word ?? 1e12) - (b.word ?? 1e12));
+    let md = `# ${title}\n${author ? `*${author}*\n` : ''}\nNotes exported from Read-Along on ${new Date().toLocaleDateString()}.\n`;
+    let chapter = null;
+    for (const x of all) {
+      if (x.chapter !== chapter) { chapter = x.chapter; md += `\n## ${chapter ? chapterLabel(chapter) : 'Front matter'}\n`; }
+      const at = x.time != null ? ` (${fmt(x.time)})` : '';
+      if (x.kind === 'bookmark') md += `\n- 🔖 Bookmark${at}: ${(x.text || '').trim().slice(0, 160)}…\n`;
+      else md += `\n> ${(x.text || '').trim().replace(/\n+/g, ' ')}${at}\n${x.note ? `\n${x.note}\n` : ''}`;
+    }
+    const blob = new Blob([md], { type: 'text/markdown' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `${title.replace(/[\\/:*?"<>|]/g, '')} - notes.md`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  },
+};
+
+// ================================================================ playing from a word
+function playAt(t, keepPlaying = true) {
+  audio.currentTime = Math.max(0, t - 0.05);
+  setFollow(true);
+  if (keepPlaying) audio.play().catch(() => {});
+}
+
+function caretAt(doc, x, y) {
+  if (doc.caretRangeFromPoint) {
+    const r = doc.caretRangeFromPoint(x, y);
+    return r && { node: r.startContainer, offset: r.startOffset };
+  }
+  if (doc.caretPositionFromPoint) {
+    const p = doc.caretPositionFromPoint(x, y);
+    return p && { node: p.offsetNode, offset: p.offset };
+  }
+  return null;
+}
+
+async function playFromPoint(contents, e) {
+  if (!S.sync || !S.meta.audio) return;
+  const doc = contents.document;
+  const pos = caretAt(doc, e.clientX, e.clientY);
+  if (!pos) return;
+  const sec = S.book.spine.get(contents.sectionIndex);
+  if (!sec) return;
+  const ix = await loadSection(sec);
+  const entry = S.sync.spine.find((x) => x.index === sec.index);
+  if (!entry) return;
+  // map the caret in the live page to the same text node in our indexed copy of the section
+  const path = [];
+  for (let n = pos.node; n && n !== doc.body; n = n.parentNode) path.unshift(Array.prototype.indexOf.call(n.parentNode.childNodes, n));
+  let node = ix.doc.body;
+  for (const i of path) node = node && node.childNodes[i];
+  if (!node) return;
+  const w = entry.word + localWordAt(ix, node, pos.offset);
+  try { contents.window.getSelection().removeAllRanges(); } catch { /* ignore */ }
+  Notes.hideMenu();
+  playAt(timeAt(w));
+}
+
+async function snippetAt(w, n) {
+  try {
+    const entry = spineEntryFor(w);
+    const ix = await loadSection(sectionFor(entry));
+    const a = pointOf(ix, w - entry.word), b = pointOf(ix, w - entry.word + n);
+    const r = ix.doc.createRange(); r.setStart(a.node, a.off); r.setEnd(b.node, b.end);
+    return r.toString();
+  } catch { return ''; }
+}
+
+// ================================================================ search
+const Search = { token: 0, results: [] };
+
+function openSearch() {
+  if (!S.book) return;
+  closePanels();
+  $('#search-panel').hidden = false;
+  const inp = $('#search-input');
+  inp.focus(); inp.select();
+}
+
+async function runSearch(q) {
+  const my = ++Search.token;
+  const status = $('#search-status'), out = $('#search-results');
+  q = q.trim();
+  if (q.length < 3) { status.textContent = q ? 'Type at least 3 letters.' : ''; out.innerHTML = ''; return; }
+  status.textContent = 'Searching…';
+  out.innerHTML = '';
+  const needle = q.toLowerCase();
+  const results = [];
+  const items = S.book.spine.spineItems || [];
+  for (const sec of items) {
+    if (my !== Search.token) return;
+    let ix;
+    try { ix = await loadSection(sec); } catch { continue; }
+    // one long string per section, remembering where each text node starts
+    let text = '';
+    const starts = [];
+    for (const n of ix.nodes) { if (text && !/\s$/.test(text)) text += ' '; starts.push(text.length); text += n.data; }
+    const lower = text.toLowerCase();
+    const entry = S.sync && S.sync.spine.find((x) => x.index === sec.index);
+    for (let at = lower.indexOf(needle); at >= 0 && results.length < 300; at = lower.indexOf(needle, at + needle.length)) {
+      let k = 0;
+      while (k + 1 < starts.length && starts[k + 1] <= at) k++;
+      const off = at - starts[k];
+      const r = ix.doc.createRange();
+      r.setStart(ix.nodes[k], off);
+      let k2 = k, end = at + needle.length;
+      while (k2 + 1 < starts.length && starts[k2 + 1] < end) k2++;
+      r.setEnd(ix.nodes[k2], Math.min(ix.nodes[k2].data.length, end - starts[k2]));
+      let word = null;
+      if (entry) { let j = 0; while (j < ix.offs[k].length && ix.offs[k][j] <= off) j++; word = entry.word + ix.starts[k] + Math.max(0, j - 1); }
+      const before = text.slice(Math.max(0, at - 70), at).replace(/\s+/g, ' ');
+      const after = text.slice(end, end + 90).replace(/\s+/g, ' ');
+      results.push({ cfi: sec.cfiFromRange(r), word, before, match: text.slice(at, end), after });
+    }
+    if (results.length >= 300) break;
+  }
+  if (my !== Search.token) return;
+  Search.results = results;
+  const chapterOf = (w) => { let t = null; for (const c of (S.sync && S.sync.chapters) || []) { if (c.word <= w) t = c.title; else break; } return t; };
+  status.textContent = results.length ? `${results.length >= 300 ? '300+' : results.length} result${results.length === 1 ? '' : 's'}` : 'No matches.';
+  out.innerHTML = results.map((x, i) => `
+    <div class="item result" data-i="${i}">
+      <button class="go">
+        <span class="meta">${esc(x.word != null && chapterOf(x.word) ? chapterLabel(chapterOf(x.word)) : '')}${x.word != null && S.sync ? ' · ' + fmt(timeAt(x.word)) : ''}</span>
+        <span class="txt">…${esc(x.before)}<mark>${esc(x.match)}</mark>${esc(x.after)}…</span>
+      </button>
+      ${x.word != null && S.sync && S.meta.audio ? '<div class="acts"><button class="icon res-play" title="Play from here"><svg><use href="#i-play"/></svg></button></div>' : ''}
+    </div>`).join('');
+}
+
+async function onSearchClick(e) {
+  const item = e.target.closest('.result'); if (!item) return;
+  const x = Search.results[+item.dataset.i]; if (!x) return;
+  if (e.target.closest('.res-play')) { closePanels(); playAt(timeAt(x.word)); return; }
+  if (isTouch) closePanels();
+  setFollow(false);
+  await S.rendition.display(x.cfi);
+  // flash the match so it's easy to spot
+  setTimeout(() => Overlay.draw('flash', [{ cfi: x.cfi, color: '#ffd54a', opacity: 0.6 }]), 120);
+  setTimeout(() => Overlay.clear('flash'), 2400);
+}
+
+// ================================================================ wiring
+$('#sel-menu').addEventListener('mousedown', (e) => e.preventDefault());       // keep the selection while clicking
+$('#sel-menu').addEventListener('click', (e) => {
+  const b = e.target.closest('button'); if (!b) return;
+  if (b.dataset.color) Notes.addHighlight(b.dataset.color, false);
+  else if (b.dataset.act === 'note') Notes.addHighlight('yellow', true);
+  else if (b.dataset.act === 'play') Notes.playSelection();
+  else if (b.dataset.act === 'copy') Notes.copySelection();
+});
+$('#note-colors').addEventListener('click', (e) => {
+  const d = e.target.closest('.dot'); if (!d) return;
+  $$('#note-colors .dot').forEach((x) => x.classList.toggle('on', x === d));
+});
+$('#note-save').addEventListener('click', () => Notes.saveEdit());
+$('#note-delete').addEventListener('click', () => Notes.deleteEdit());
+$('#note-text').addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) Notes.saveEdit(); });
+$('#btn-bookmark').addEventListener('click', () => Notes.toggleBookmark());
+$('#btn-notes').addEventListener('click', () => ($('#notes-panel').hidden ? Notes.openPanel() : closePanels()));
+$('#notes-panel .tabs').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) { Notes.tab = b.dataset.tab; Notes.renderPanel(); } });
+$('#notes-list').addEventListener('click', (e) => Notes.onPanelClick(e));
+$('#btn-export').addEventListener('click', () => Notes.exportMarkdown());
+$('#btn-search').addEventListener('click', () => ($('#search-panel').hidden ? openSearch() : closePanels()));
+let searchTimer = null;
+$('#search-input').addEventListener('input', (e) => { clearTimeout(searchTimer); searchTimer = setTimeout(() => runSearch(e.target.value), 350); });
+$('#search-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') { clearTimeout(searchTimer); runSearch(e.target.value); } });
+$('#search-results').addEventListener('click', onSearchClick);
+document.addEventListener('mousedown', (e) => { if (!e.target.closest('#sel-menu')) Notes.hideMenu(); });
+// other devices may have added notes: refresh now and then
+setInterval(async () => {
+  if (!S.book || !S.meta || document.hidden) return;
+  const before = JSON.stringify([Shared.state && Shared.state.highlights, Shared.state && Shared.state.bookmarks]);
+  await Shared.load(S.meta.id);
+  if (JSON.stringify([Shared.state && Shared.state.highlights, Shared.state && Shared.state.bookmarks]) !== before) {
+    Notes.renderAll(); Notes.updateBookmarkBtn();
+    if (!$('#notes-panel').hidden) Notes.renderPanel();
+  }
+}, 60000);
