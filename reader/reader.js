@@ -19,7 +19,8 @@ const store = {
   get(k, d = null) { try { const v = localStorage.getItem('ra:' + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
   set(k, v) { try { localStorage.setItem('ra:' + k, JSON.stringify(v)); } catch { /* private mode / quota */ } },
 };
-const DEFAULTS = { theme: 'light', font: 100, rate: 1, highlight: 'phrase', spread: false, fontFamily: 'book', lineHeight: 'book', width: 'normal' };
+const DEFAULTS = { theme: 'light', font: 100, rate: 1, highlight: 'phrase', spread: false, fontFamily: 'book', lineHeight: 'book', width: 'normal',
+  keepAwake: true };
 const settings = Object.assign({}, DEFAULTS, store.get('settings', {}));
 if (settings.highlight === true) settings.highlight = 'phrase';      // older setting format
 if (settings.highlight === false) settings.highlight = 'off';
@@ -35,6 +36,13 @@ const S = {
   saveTimer: null, syncTimer: null, tickTimer: null,
   sleep: null,                 // { until: ms } or { chapterEnd: seconds }
   audioReady: false,           // the audio is loaded and at the book's place (until then, the place isn't saved)
+  // reading on with the audio paused (see pageTurn):
+  pin: null,                   // { w, from, to }: while the audio time is in [from, to], the place is word w exactly
+  armed: null,                 // { cfi, t }: this page was reached by reading on from the place (it can carry it on)
+  pageShownAt: 0,              // when the page on screen appeared (performance.now())
+  navSeq: 0,                   // counts other moves of the book (display, follow on/off) that cancel a carry
+  dwellMs: 3000,               // a page shown at least this long counts as read (a quick flip to peek ahead doesn't)
+  turnWaitMs: 3000,            // longest wait for epub.js to turn a page (it can leave a turn unsettled at closing)
 };
 
 const fmt = (t) => {
@@ -131,6 +139,8 @@ async function openBook(meta) {
   S.meta = meta;
   S.audioReady = false;
   S.follow = true; S.lastW = -1; S.loc = null; S.hl = []; S.sections = new Map(); S.sleep = null;
+  S.pin = null; S.armed = null; S.pageShownAt = 0;
+  Turns.reset();
   updateSleepUI();
   $('#library').hidden = true;
   $('#reader').hidden = false;
@@ -147,9 +157,13 @@ async function openBook(meta) {
   // pos.moved = when this device itself last moved the place (by listening or jumping). Places saved by
   // older versions have no such time (they were re-stamped just for being open), so the synced place wins.
   if (remote && remote.time != null && (remote.updated || 0) > (pos.moved || 0) + 1000) {
-    pos = Object.assign(pos, { time: remote.time, cfi: remote.cfi || pos.cfi, moved: remote.updated || 0 });
-    if (remote.device && !fromHere(remote) && remote.time > 5) toast(`Picking up where you left off on ${remote.device}.`);
-  } else if (pos.time != null && pos.moved && (!remote || Math.abs((remote.time || 0) - pos.time) >= 2)) {
+    const here = pos.time;                            // (the same place, just sent a little later: nothing to say)
+    pos = Object.assign(pos, { time: remote.time, cfi: remote.cfi || pos.cfi, moved: remote.updated || 0, word: null });
+    if (remote.device && !fromHere(remote) && remote.time > 5 && !(here != null && Math.abs(remote.time - here) < 2)) {
+      toast(`Picking up where you left off on ${remote.device}.`);
+    }
+  } else if (pos.time != null && pos.moved && (!remote || Math.abs((remote.time || 0) - pos.time) >= 2
+             || (pos.word != null && Math.abs((remote.time || 0) - pos.time) > 1e-3))) {     // (a page reached by reading on: however small)
     // this device has a newer place the others never got (e.g. closed before it was sent): send it now,
     // with the time it was really reached, so it never beats something newer from another device
     catchUp = { op: 'position', v: 2, from: myId, time: pos.time, cfi: pos.cfi || null, dur: pos.dur || null,
@@ -175,7 +189,8 @@ async function openBook(meta) {
     registerThemes();
     S.rendition.hooks.content.register((contents) => { applyTypography(contents); wireContent(contents); });
     applySettings(false);
-    S.rendition.on('relocated', (loc) => { S.loc = loc; onRelocated(); });
+    S.rendition.on('relocated', (loc) => { S.loc = loc; S.pageShownAt = performance.now(); onRelocated(); });
+    S.rendition.on('displayed', () => { S.navSeq++; });        // the book was shown somewhere (not a page turn)
     S.rendition.on('keydown', onKey);
     await Promise.race([S.book.ready, openFailed]);
     if (stale()) return;
@@ -204,8 +219,13 @@ async function openBook(meta) {
     $('#t-dur').textContent = fmt(audio.duration);
     setupMediaSession();
     audio.currentTime = pos.time != null ? pos.time : 0;     // always explicit: never a place left from another book
+    // a place reached by reading on (pageTurn) is that page's first word, also where many words share a moment
+    if (S.sync && pos.word != null && pos.time != null && Math.abs(audio.currentTime - pos.time) < 0.05) {
+      S.pin = { w: pos.word, from: audio.currentTime, to: audio.currentTime, carry: true, stamp: pos.moved || Date.now() };
+    }
   }
   S.savedT = meta.audio ? (pos.time != null ? pos.time : 0) : null;    // where this window is; savePos compares with it
+  S.savedW = S.pin ? S.pin.w : null;                                   // (and the word, for a place reached by reading on)
   S.audioReady = true;
 
   if (S.sync && meta.audio) {
@@ -220,7 +240,7 @@ async function openBook(meta) {
   drawTicks();
   Notes.updateBookmarkBtn();
   clearInterval(S.saveTimer);
-  S.saveTimer = setInterval(savePos, 5000);
+  S.saveTimer = setInterval(() => savePos({ tick: true }), 5000);
   clearInterval(S.syncTimer);
   S.syncTimer = setInterval(() => { if (S.sync && !S.sync.complete) loadSync(true); }, 60000);
   if (isTouch && !store.get('tip-touch')) { toast('Tip: tap the left or right side to turn pages, the middle for full screen.', 5000); store.set('tip-touch', true); }
@@ -230,43 +250,62 @@ function closeBook() {
   S.openSeq = (S.openSeq || 0) + 1;                  // a book still opening stops here
   if (S.reloadDone) { audio.removeEventListener('loadedmetadata', S.reloadDone); S.reloadDone = null; }
   S.reloadTo = null;
+  Turns.reset();                                     // page turns still waiting: dropped
   if (!S.book) return;
+  audio.pause();                                     // first: a reading session that ends is synced right away
   savePos();
   Shared.pushPosition(true);
   Notes.hideMenu();
-  audio.pause();
   audio.removeAttribute('src');
   audio.load();
   clearInterval(S.saveTimer); clearInterval(S.syncTimer); stopTick();
   S.sleep = null; audio.volume = 1;
   try { S.book.destroy(); } catch { /* ignore */ }
   S.book = S.rendition = S.sync = null; S.at = S.aw = null; S.audioReady = false; S.savedT = null;
+  S.pin = null; S.armed = null;
   try { audio.currentTime = 0; } catch { /* clears a start position still pending from this book */ }
   $('#viewer').innerHTML = '';
   closePanels();
+  Awake.update();                                    // (the screen may sleep again)
 }
 
-function savePos() {
+// opts.tick: the regular save every 5 s. opts.end: the window is closing. Any other save (the 'pause' event,
+// leaving the app, closing the book) ends a reading session: it is sent at once.
+function savePos(opts) {
   if (!S.meta || !S.book) return;
   // while the audio is still loading (or reloading) its time is 0, not the book's place: save nothing
   if (S.meta.audio && !(S.audioReady && audio.readyState >= 1)) return;
+  const tick = !!(opts && opts.tick === true), end = !!(opts && opts.end === true);
   const prev = store.get('pos:' + S.meta.id) || {};
   const time = audio.src ? audio.currentTime : null;
-  // "moved" = the place really changed in THIS window (listening or a jump), compared with where this window
-  // was, not with the saved place (another window of the app may have saved a newer one). Just being open
+  // a place reached by reading on stays one only while the audio stays there: once it moved away (play, a jump),
+  // coming back to that time later is a new move, sent and stamped as such
+  if (S.pin && S.pin.carry && !carriedPlace()) S.pin.carry = false;
+  const carried = carriedPlace();
+  // "moved" = the place really changed in THIS window (listening, a jump, or reading on), compared with where this
+  // window was, not with the saved place (another window of the app may have saved a newer one). Just being open
   // is not a move, and then nothing but "still open" is written, so a forgotten window can't undo progress.
-  const moved = time != null && S.savedT != null && Math.abs(time - S.savedT) >= 1;
+  // A place reached by reading on counts however small the step (from a page's last word, or where many words
+  // share a moment of the audio): it is compared by its word (media clocks round times differently).
+  const moved = time != null && S.savedT != null && (Math.abs(time - S.savedT) >= 1 || (carried && S.pin.w !== S.savedW));
   if (moved) {
     S.savedT = time;
+    S.savedW = carried ? S.pin.w : null;
     store.set('pos:' + S.meta.id, Object.assign(prev, {
       time, dur: audio.duration || prev.dur || null,
       cfi: S.loc && S.loc.start ? S.loc.start.cfi : prev.cfi, chapter: currentChapter(audio.currentTime).title || prev.chapter,
-      opened: Date.now(), moved: Date.now(),
+      word: carried ? S.pin.w : null,
+      opened: Date.now(), moved: carried ? S.pin.stamp : Date.now(),     // (reading on: when that page was reached)
     }));
   } else {
     store.set('pos:' + S.meta.id, Object.assign(prev, { opened: Date.now() }));
   }
-  Shared.pushPosition(audio.paused);
+  // reading on with the audio paused: the regular save sends the place at most every 5 minutes (not a GitHub
+  // update per page); the end of the session sends it at once. Either way it is stamped with when that page was
+  // reached, so it can never beat something newer from another device (e.g. a window left open)
+  const place = carried ? { carried, stamp: S.pin.stamp, word: S.pin.w } : {};
+  if (tick && audio.paused && carried) Shared.pushPosition(false, Object.assign({ lazy: true }, place));
+  else Shared.pushPosition(audio.paused || end, Object.assign({ end }, place));
 }
 
 // ================================================================ sync data
@@ -430,12 +469,34 @@ function localWordAt(ix, container, offset) {
 }
 
 // ================================================================ following the audio
+// the word of the place in the audio. +0.1 s: measured (verify_sync.py) to best match the word being spoken with
+// Whisper's timestamps (page-level sync: none). A place set for a word (reading on, Read from here) is exactly
+// that word while the time is still there (also where many words share a moment of the audio)
+const leadTime = () => (S.dense ? 0.1 : 0);
+function placeWord() {
+  if (!S.sync) return null;
+  const t = audio.currentTime;
+  if (S.pin && t >= S.pin.from - 0.05 && t <= S.pin.to + 0.05) return S.pin.w;
+  const wf = wordAt(t + leadTime());
+  return wf == null ? null : Math.floor(wf);
+}
+// is the place one reached by reading on (pageTurn), with the audio still there?
+function carriedPlace() { return !!(S.pin && S.pin.carry && Math.abs(audio.currentTime - S.pin.to) < 0.05); }
+// the audio time that stands for word w: just inside its start, so the word it shows and highlights is w itself
+// (a little earlier would be the word before, often on the previous page). null if there's no such time
+function timeForWord(w) {
+  if (!S.sync || w == null || !isFinite(w)) return null;
+  const lead = leadTime(), a = timeAt(w), b = timeAt(w + 1);
+  if (a == null || !isFinite(a) || b == null || !isFinite(b)) return null;
+  const end = Math.min(audio.duration || Infinity, S.sync.duration || Infinity) - 0.05;
+  const t = Math.max(0, Math.min(end, a - lead + Math.min(0.02, Math.max(0, b - a) / 2)));
+  return Math.floor(wordAt(t + lead)) === w ? t : null;
+}
+
 async function followAudio(force = false) {
   if (!S.sync || !S.rendition) return;
-  // +0.1 s: measured (verify_sync.py) to best match the word being spoken with Whisper's timestamps
-  const wf = wordAt(audio.currentTime + (S.dense ? 0.1 : 0));
-  if (wf == null) return;
-  const w = Math.floor(wf);
+  const w = placeWord();
+  if (w == null) return;
   if (!force && w === S.lastW) return;
   if (S.busy) { S.pending = true; return; }
   S.busy = true;
@@ -473,8 +534,22 @@ async function followAudio(force = false) {
 // Is this position visible right now? Measured on screen: epub.js's page start/end can be wrong on
 // chapter-opening pages (end before start), which used to make the reader re-show the page endlessly.
 function onCurrentPage(cfi) {
+  const seen = onScreen(cfi);
+  if (seen != null) return seen;
+  const loc = S.loc;                                   // fallback: epub.js's own idea of the page
+  if (!loc || !loc.start || !loc.end) return false;
+  const cmp = new ePub.CFI();
+  try { return cmp.compare(cfi, loc.start.cfi) >= 0 && cmp.compare(cfi, loc.end.cfi) <= 0; } catch { return false; }
+}
+// the measuring part: true/false, or null when the position isn't in a shown section or can't be measured
+function onScreen(cfi) {
+  const side = screenSide(cfi);
+  return side == null ? null : side === 0;
+}
+// where a position is: -1 before the page shown (left of it), 0 on it, 1 after it; null if it can't be measured
+function screenSide(cfi) {
   let spinePos;
-  try { spinePos = new ePub.CFI(cfi).spinePos; } catch { return false; }
+  try { spinePos = new ePub.CFI(cfi).spinePos; } catch { return null; }
   const viewer = $('#viewer').getBoundingClientRect();
   for (const c of S.rendition ? S.rendition.getContents() : []) {
     if (c.sectionIndex !== spinePos) continue;
@@ -486,14 +561,11 @@ function onCurrentPage(cfi) {
       const rr = r.cloneRange(); rr.setEnd(r.startContainer, r.startOffset + 1);   // collapsed: measure one character
       rect = rr.getBoundingClientRect();
     }
-    if (!rect.width && !rect.height && !rect.left && !rect.top) break;            // can't measure: fall back below
+    if (!rect.width && !rect.height && !rect.left && !rect.top) return null;      // can't measure
     const x = c.window.frameElement.getBoundingClientRect().left + rect.left + Math.min(rect.width, 2);
-    return x >= viewer.left - 1 && x <= viewer.right + 1;
+    return x < viewer.left - 1 ? -1 : x > viewer.right + 1 ? 1 : 0;
   }
-  const loc = S.loc;                                   // fallback: epub.js's own idea of the page
-  if (!loc || !loc.start || !loc.end) return false;
-  const cmp = new ePub.CFI();
-  try { return cmp.compare(cfi, loc.start.cfi) >= 0 && cmp.compare(cfi, loc.end.cfi) <= 0; } catch { return false; }
+  return null;
 }
 
 // ---------------------------------------------------------------- highlight overlay
@@ -568,6 +640,7 @@ function drawHighlight(ranges, mode) {
 
 function setFollow(on) {
   S.follow = on;
+  S.navSeq++;                                          // (a page turn that is still carrying the place stops)
   updateFollowUI();
   if (on) { S.lastW = -1; followAudio(true); }
 }
@@ -580,19 +653,60 @@ function updateFollowUI() {
     : 'Jump back to where the audio is and keep following (F)';
 }
 
+// play from the top of the page on screen. The audio starts a moment before its first word; meanwhile the page
+// stays (that moment belongs to the previous page's last word, which used to flip the page back for a second)
 async function readFromHere() {
-  if (!S.sync || !S.loc || !S.loc.start) return;
-  const w = await wordAtCfi(S.loc.start.cfi);
-  if (w == null) return;
-  audio.currentTime = Math.max(0, timeAt(w) - 0.3);
+  if (!S.sync || !S.rendition) return;
+  let w = await firstWordShown();
+  if (w == null && S.rendition) {                      // a page without words (a picture): from the text after it
+    const l = S.rendition.currentLocation();
+    w = l && l.start ? await wordAtCfi(l.start.cfi) : null;
+    // (epub.js gives such a page the start of the text after it inside a chapter, but on a chapter's last pages
+    // the start of its last text, before the page: then from the next chapter)
+    if (w != null && S.rendition) {
+      const last = l.end && l.end.displayed && l.end.displayed.page === l.end.displayed.total;
+      const lc = await locate(w);
+      if (last || (lc && screenSide(lc.cfi) < 0)) {
+        const next = S.sync.spine.find((e) => e.index > l.start.index);
+        if (next) w = next.word;
+      }
+    }
+  }
+  if (w == null || !S.rendition) return;
+  const at = timeForWord(w);
+  const to = at != null ? at : Math.max(0, timeAt(w) - leadTime());
+  audio.currentTime = Math.max(0, to - 0.25);
+  S.pin = { w, from: audio.currentTime, to };
   setFollow(true);
   audio.play().catch(() => {});
+  Awake.update(true);
+}
+
+// the first word shown on the page now; null if it shows none (e.g. a picture). epub.js's own idea of the page's
+// start is a hint: it can be a word or two off, or point at the next section
+async function firstWordShown(loc) {
+  if (!S.sync || !S.rendition) return null;
+  loc = loc || S.rendition.currentLocation();
+  const hint = loc && loc.start && loc.start.cfi;
+  if (!hint) return null;
+  let w = await wordAtCfi(hint);
+  if (w == null || !S.rendition) return null;
+  const last = S.sync.total_words != null ? S.sync.total_words - 1 : Infinity;
+  const shown = async (x) => {
+    if (x < 0 || x > last) return false;
+    const l = await locate(x);
+    return !!(l && onScreen(l.cfi) === true);         // measured only (S.loc can still be the page before)
+  };
+  let k = 0;
+  while (!(await shown(w))) { if (++k > 50 || !S.rendition) return null; w++; }
+  for (let b = 0; b < 10 && (await shown(w - 1)); b++) w--;
+  return w;
 }
 
 // smooth updates while playing (timeupdate alone fires only ~4x a second)
 function startTick() {
   stopTick();
-  S.tickTimer = setInterval(() => { followAudio(); checkSleep(); Shared.tickListen(); }, 90);
+  S.tickTimer = setInterval(() => { followAudio(); checkSleep(); Shared.tickListen(); Awake.tick(); }, 90);
 }
 function stopTick() { clearInterval(S.tickTimer); S.tickTimer = null; }
 
@@ -714,6 +828,13 @@ function wireContent(contents) {
   const doc = contents.document;
   if (doc.__raWired) return;                     // the hook can run again for the same page after a resize
   doc.__raWired = true;
+  // Does the app hear anything on the book page? On iPhones (WebKit) it doesn't: the page is a sandboxed frame
+  // without scripts, so these listeners never run. Then the page edges become invisible tap strips (reader.css,
+  // body.frame-blind); elsewhere the page keeps its own taps (also selecting text, links, highlights).
+  let heard = false;
+  doc.addEventListener('ra-probe', () => { heard = true; });
+  doc.dispatchEvent(new Event('ra-probe'));
+  document.body.classList.toggle('frame-blind', !heard);
   doc.addEventListener('dblclick', (e) => playFromPoint(contents, e));
   doc.addEventListener('click', (e) => {
     if (isTouch || String(doc.getSelection ? doc.getSelection() : '')) return;
@@ -756,6 +877,7 @@ function applySettings(relayout = true) {
   });
   $('#font-val').textContent = settings.font + '%';
   $('#opt-spread').checked = !!settings.spread;
+  $('#opt-awake').checked = settings.keepAwake !== false;
   if (S.rendition) {
     S.rendition.themes.select(effTheme());
     if (typeof Notes !== 'undefined') Notes.renderAll();
@@ -777,6 +899,7 @@ function setSleep(v) {
   } else S.sleep = { until: Date.now() + (+v) * 60000 };
   audio.volume = 1;
   updateSleepUI();
+  Awake.update();                                       // (with a sleep timer the screen may turn off)
   closePanels();
   if (S.sleep) toast(v === 'chapter' ? 'Will pause at the end of this chapter.' : `Will pause in ${v} minutes.`);
 }
@@ -803,6 +926,45 @@ function updateSleepUI() {
     (left == null && b.dataset.sleep === '0') || (S.sleep && S.sleep.chapterEnd && b.dataset.sleep === 'chapter')));
 }
 setInterval(() => { if (S.sleep) updateSleepUI(); }, 15000);
+
+// ================================================================ keeping the screen on while the audio plays
+// Reading along, you don't touch the screen, so it would turn off (Auto-Lock). While the audio plays with a book
+// open, and the setting is on, the app asks to keep it on. Not with a sleep timer (you're falling asleep), and never
+// while paused or with the library showing. iPhones only allow this from iOS 18.4, and only after a tap: a play
+// started by a tap asks right away; otherwise the next tap anywhere (also on the book page) asks again.
+const Awake = {
+  s: null, asking: 0, askedAt: 0,
+  wanted() {
+    return settings.keepAwake !== false && 'wakeLock' in navigator && !!S.book && !audio.paused && !audio.error
+      && !S.sleep && document.visibilityState === 'visible';
+  },
+  held() { return !!this.s && !this.s.released; },
+  update(gesture = false) {
+    if (!this.wanted()) { this.drop(); return; }
+    if (this.held()) return;
+    if (this.asking > 0 && !gesture && Date.now() - this.askedAt < 5000) return;   // one at a time (unless from a tap)
+    this.asking++; this.askedAt = Date.now();
+    let req;
+    try { req = navigator.wakeLock.request('screen'); } catch { this.asking--; return; }
+    Promise.resolve(req).then((s) => {
+      this.asking--;
+      if (!s || s.released) return;
+      if (!this.wanted() || this.held()) { s.release().catch(() => {}); return; }   // paused or hidden meanwhile
+      this.s = s;
+      s.addEventListener('release', () => { if (this.s === s) this.s = null; });     // (the browser lets go when hidden)
+    }, () => { this.asking--; });                       // not allowed now: asked again on the next tap
+  },
+  drop() { const s = this.s; this.s = null; if (s && !s.released) s.release().catch(() => {}); },
+  // while playing (every 90 ms): ask again after a tap (a tap on the book page counts, though it never reaches us)
+  tick() {
+    if (this.held() || this.asking > 0 || Date.now() - this.askedAt < 1000 || !this.wanted()) return;
+    const tapped = navigator.userActivation ? navigator.userActivation.isActive : Date.now() - this.askedAt > 3000;
+    if (tapped) this.update(true);
+  },
+};
+['touchend', 'click', 'keydown'].forEach((type) => document.addEventListener(type, () => {
+  if (!Awake.held() && Awake.wanted()) Awake.update(true);
+}, { capture: true, passive: true }));
 
 // ================================================================ media session (lock screen, headset buttons)
 function setupMediaSession() {
@@ -835,12 +997,122 @@ function jumpChapter(d) {
 }
 
 function skip(d) { audio.currentTime = Math.max(0, Math.min((audio.duration || 0) - 1, audio.currentTime + d)); }
-function togglePlay() { if (!audio.src) return; if (audio.paused) audio.play().catch(() => toast('Tap play again to start the audio.')); else audio.pause(); }
-function pageTurn(dir) {
-  if (!S.rendition) return;
-  if (S.follow) setFollow(false);
-  if (dir > 0) S.rendition.next(); else S.rendition.prev();
+function togglePlay() {
+  if (!audio.src) return;
+  if (audio.paused) { audio.play().catch(() => toast('Tap play again to start the audio.')); Awake.update(true); } else audio.pause();
 }
+
+// ================================================================ page turns, and reading on with the audio paused
+// While the audio is paused, reading on page by page moves your place along: when you turn forward from the page
+// that shows the place, the place becomes the next page's first word (its time in the audio), so it is saved and
+// synced, and play continues from there. Only a page you stayed on for a moment counts (S.dwellMs: a quick flip to
+// peek ahead doesn't, though it keeps the chain going), and turning back never moves it (to look something up).
+// Turns are done one after another (a queue), and a closed book drops the ones still waiting.
+const Turns = {
+  q: [], busy: false, seq: 0,
+  reset() { const q = this.q; this.q = []; this.seq++; this.busy = false; q.forEach((t) => t.done(false)); },
+  async pump() {
+    if (this.busy) return;
+    const t = this.q.shift();
+    if (!t) return;
+    this.busy = true;
+    const my = this.seq;
+    let r = false;
+    try { r = await turnStep(t.dir, my); } catch (e) { console.warn('page turn failed', e); }
+    t.done(r);
+    if (my !== this.seq) return;                         // the book was closed (or another opened) meanwhile
+    this.busy = false;
+    this.pump();
+  },
+};
+function pageTurn(dir) {
+  return new Promise((done) => {
+    // (not while the book is still opening; and a key held down doesn't pile up turns)
+    if (!S.rendition || !$('#loading').hidden || Turns.q.length >= 2) { done(false); return; }
+    Turns.q.push({ dir, done });
+    Turns.pump();
+  });
+}
+// a promise, or false after ms (epub.js can leave a turn unsettled when the book is closed meanwhile)
+const within = (p, ms) => Promise.race([p, new Promise((res) => setTimeout(() => res(false), ms))]);
+
+async function turnStep(dir, my) {
+  const live = () => my === Turns.seq && !!S.rendition;
+  const r = S.rendition;
+  if (!r) return false;
+  const carry = dir > 0 ? await carryFrom() : null;     // decided on the page being left
+  if (!live()) return false;
+  const follow0 = S.follow;
+  if (carry) S.follow = false;                            // (quietly: the button stays as it is if the place moves on)
+  else if (S.follow) setFollow(false);
+  const nav0 = S.navSeq;
+  try {
+    await within(dir > 0 ? r.next() : r.prev(), S.turnWaitMs);
+  } catch (e) {                                           // the page couldn't be turned: as it was
+    if (carry && live()) { S.follow = follow0; updateFollowUI(); }
+    throw e;
+  }
+  if (!live()) return false;
+  S.pageShownAt = performance.now();                     // (a turn waiting right behind this one hasn't read it)
+  if (!carry) return true;
+  const settle = () => { if (!S.follow) updateFollowUI(); };
+  // anything else moving the book or the audio meanwhile (a jump, a seek, play) wins over this turn
+  const same = () => live() && S.navSeq === nav0 && audio.paused && Math.abs(audio.currentTime - carry.t) < 0.01;
+  const loc = r.currentLocation();                       // (the page now shown; 'relocated' only comes a frame later)
+  const start = loc && loc.start && loc.start.cfi, page = pageOf(loc);
+  // (did the page turn? Its start alone can't tell: epub.js gives a page without words the start of a neighbour)
+  if (!same() || !start || (start === carry.start && page === carry.page)) { settle(); return true; }
+  const arm = () => { S.armed = { cfi: start, page, t: audio.currentTime }; settle(); return true; };
+  if (!carry.now) {
+    if (carry.remind) Shared.remindOffer();
+    return arm();
+  }
+  const w = await firstWordShown(loc);
+  if (!same()) { settle(); return true; }
+  if (w == null) return arm();                           // a page without words (a map, a picture): carried on past it
+  if (carry.wp != null && w <= carry.wp) { settle(); return true; }
+  const t = timeForWord(w);
+  if (t == null) return arm();                           // no audio time stands for this word (e.g. after the narration)
+  audio.currentTime = t;
+  // stamped now, when the page is reached (later than anything known now, like any move): sent later, it can't
+  // beat what another device does meanwhile
+  const known = (Shared.state && Shared.state.position && Shared.state.position.updated) || 0;
+  S.pin = { w, from: audio.currentTime, to: audio.currentTime, carry: true, stamp: Math.max(Date.now(), known + 1) };
+  S.armed = null;
+  S.loc = loc;                                           // (the page now shown, for the place's saved CFI)
+  setFollow(true);
+  savePos({ tick: true });                               // kept on this device at once (sent later, see savePos)
+  return true;
+}
+
+// Does a forward turn from the page shown now carry the place along? null if not; otherwise what the turn needs:
+// { t: the audio time now, start: this page's start, wp: the place's word, now: carry it now (or only keep the
+// chain going: a quick flip, or newer progress from another device not yet known or answered), remind }
+async function carryFrom() {
+  if (!S.sync || !S.meta || !S.meta.audio || !audio.paused || !S.audioReady || audio.readyState < 1 || S.reloadTo != null) return null;
+  const loc = S.rendition.currentLocation();
+  const start = loc && loc.start && loc.start.cfi, page = pageOf(loc);
+  if (!start) return null;
+  const t = audio.currentTime, wp = placeWord();
+  // (an armed page still counts after the text was laid out again, e.g. turned sideways or a new text size, as long
+  // as its first words are still on screen)
+  let holds = !!(S.armed && Math.abs(S.armed.t - t) < 0.01
+    && ((S.armed.page === page && S.armed.cfi === start) || onScreen(S.armed.cfi) === true));
+  if (!holds && wp != null) {
+    const l = await locate(wp);
+    holds = !!(l && onScreen(l.cfi) === true);
+  }
+  if (!holds || !S.rendition) return null;
+  // newer progress from another device may be on its way (just opened, or back to the app) or was offered and not
+  // answered: the first such turn shows the offer again, and only a further one takes over
+  const waiting = !!(Shared.hold || Shared.resuming);
+  const o = Shared.pendingOffer;
+  const remind = !waiting && !!(o && !o.reminded && o.at > Shared.lastMoveAt + 1000);
+  const read = performance.now() - (S.pageShownAt || 0) >= S.dwellMs;
+  return { t, start, page, wp, now: read && !waiting && !remind, remind };
+}
+// which page is shown: its section and page number there
+const pageOf = (l) => (l && l.start && l.start.displayed ? l.start.index + ':' + l.start.displayed.page : null);
 function closePanels() { $$('.panel').forEach((p) => { p.hidden = true; }); }
 function togglePanel(id) { const p = $(id); const open = p.hidden; closePanels(); p.hidden = !open; if (open && id === '#toc-panel') { const c = $('#toc a.current'); if (c) c.scrollIntoView({ block: 'center' }); } }
 
@@ -985,6 +1257,20 @@ $('#opt-spread').addEventListener('change', (e) => {
   settings.spread = e.target.checked; saveSettings(); applySettings(false);
   if (S.rendition) { S.rendition.spread(settings.spread ? 'auto' : 'none', 1100); setTimeout(() => { S.lastW = -1; followAudio(true); }, 300); }
 });
+$('#opt-awake').addEventListener('change', (e) => { settings.keepAwake = e.target.checked; saveSettings(); Awake.update(true); });
+// (a browser that can't keep the screen on, e.g. the phone's browser over plain http: no such setting)
+if (!('wakeLock' in navigator)) $('#row-awake').hidden = true;
+
+// phones and touch screens: the page edges are invisible tap strips (on iPhones, taps on the book page itself never
+// reach the app). A sideways swipe that starts on them turns the page too.
+$$('.zone').forEach((z) => {
+  let sx = 0, sy = 0, st = 0;
+  z.addEventListener('touchstart', (e) => { const t = e.changedTouches[0]; sx = t.clientX; sy = t.clientY; st = Date.now(); }, { passive: true });
+  z.addEventListener('touchend', (e) => {
+    const t = e.changedTouches[0], dx = t.clientX - sx, dy = t.clientY - sy;
+    if (Math.abs(dx) > 45 && Math.abs(dx) > Math.abs(dy) * 1.5 && Date.now() - st < 700) { e.preventDefault(); pageTurn(dx < 0 ? 1 : -1); }
+  });
+});
 
 let scrubbing = false;
 const scrub = $('#scrub');
@@ -993,18 +1279,32 @@ scrub.addEventListener('change', () => { scrubbing = false; audio.currentTime = 
 
 audio.addEventListener('timeupdate', onTime);
 audio.addEventListener('seeked', () => { S.lastW = -1; followAudio(true); updatePosition(); updateChapter(audio.currentTime); });
-audio.addEventListener('play', () => { $('#ico-play').hidden = true; $('#ico-pause').hidden = false; $('#btn-play').setAttribute('aria-label', 'Pause'); startTick(); updateFollowUI(); Shared.remindOffer(); });
-audio.addEventListener('pause', () => { $('#ico-play').hidden = false; $('#ico-pause').hidden = true; $('#btn-play').setAttribute('aria-label', 'Play'); stopTick(); savePos(); updateFollowUI(); });
+audio.addEventListener('play', () => { $('#ico-play').hidden = true; $('#ico-pause').hidden = false; $('#btn-play').setAttribute('aria-label', 'Pause'); startTick(); updateFollowUI(); Shared.remindOffer(); Awake.update(); });
+audio.addEventListener('pause', () => {
+  $('#ico-play').hidden = false; $('#ico-pause').hidden = true; $('#btn-play').setAttribute('aria-label', 'Play');
+  stopTick(); savePos(); updateFollowUI(); Awake.update();
+  S.pageShownAt = performance.now();                   // (reading on counts from here: listening isn't reading the page)
+});
 audio.addEventListener('ratechange', updatePosition);
 audio.addEventListener('waiting', () => $('#btn-play').classList.add('buffering'));
 ['playing', 'pause', 'canplay', 'seeked'].forEach((ev) => audio.addEventListener(ev, () => $('#btn-play').classList.remove('buffering')));
-audio.addEventListener('error', () => { if (audio.getAttribute('src') && !audio.getAttribute('src').includes('local-audio/')) toast("The audiobook couldn't be loaded. Check that the PC is reachable."); });
-window.addEventListener('beforeunload', savePos);
+audio.addEventListener('error', () => {
+  if (audio.getAttribute('src') && !audio.getAttribute('src').includes('local-audio/')) toast("The audiobook couldn't be loaded. Check that the PC is reachable.");
+  Awake.update();                                      // (nothing plays: the screen may turn off)
+});
+// the window closes: send the place now (also while playing), and sync it right away
+window.addEventListener('beforeunload', () => savePos({ end: true }));
+window.addEventListener('pagehide', () => savePos({ end: true }));
 let resizeTimer = null;
 window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { if (S.book) { S.lastW = -1; followAudio(true); Notes.renderAll(); } }, 250); });
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) savePos();
-  else if (S.book) { S.lastW = -1; followAudio(true); Shared.refresh(); }     // and see if another device got further
+  else if (S.book) {
+    S.lastW = -1; followAudio(true);
+    S.pageShownAt = performance.now();                 // (time away from the app isn't time reading the page)
+    Shared.resume();                                   // and see if another device got further
+  }
+  Awake.update();
 });
 
 // heartbeat: lets the background server know a reader window is still open

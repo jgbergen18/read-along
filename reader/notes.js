@@ -48,12 +48,18 @@ const Shared = {
   // (re-sending an unchanged place as "newest" would override progress made on another device)
   resetPush(pos) {
     this.lastPushT = pos && pos.time != null ? pos.time : -1;
+    this.lastPushW = pos && pos.word != null ? pos.word : null;     // (a place reached by reading on: its word)
     this.lastPushAt = 0;
+    this.listenAcc = 0; this.lastTick = 0;     // (listening time left over from another book isn't this book's)
     this.lastMoveAt = (pos && pos.moved) || 0;
     this.openedWith = this.lastMoveAt;        // the place's time stamp when the book was opened
     this.offeredAt = 0;
     this.pendingOffer = null;
     this.hold = false;
+    this.resuming = false;
+    this.resumeFrom = null;                   // (back in the app: was this device playing then?)
+    this.owedPos = false;                     // a place held back while coming back, sent when the news is in
+    this.flushOwed = false;
     this.unsent = null;
     this.unsentListen = [];
   },
@@ -73,26 +79,48 @@ const Shared = {
   },
   unsent: null,           // a place that could not be sent (no connection): sent again later, unchanged
   unsentListen: [],       // listening-time reports that could not be sent: sent again as they were (counted once)
-  pushPosition(force) {
-    if (!S.meta || !audio.getAttribute('src') || !S.audioReady || audio.readyState < 1 || this.hold) return;
+  flushOwed: false,       // something was sent without asking for an immediate sync: the session's end asks for it
+  // force: the end of a reading session (or a jump while paused): send now, and (when paused, or opts.end: the
+  // window closes) ask for an immediate sync. opts.lazy: a place reached by reading on, sent at most every 5 min.
+  // opts.carried / word / stamp: that place (it counts as new however small the step; stamped when it was reached).
+  pushPosition(force, opts = {}) {
+    if (!S.meta || !audio.getAttribute('src') || !S.audioReady || audio.readyState < 1) return;
+    // just opened before the newest progress could be fetched: nothing is sent until it is (the place shown may be
+    // behind; a newer one is then offered). Just back in the app, newer news may be on its way: only the end of a
+    // session is sent meanwhile. Its place goes out only if this device was still playing when it came back
+    // (listening in the background), stamped when it was reached; a place reached after coming back waits until
+    // the news is in (Shared.resume sends it then, after offering any newer place)
+    if (this.hold || (this.resuming && !force)) return;
+    const held = this.resuming;
     const t = audio.currentTime, now = Date.now();
-    if (!force && now - this.lastPushAt < 15000) return;
+    if (!force && now - this.lastPushAt < (opts.lazy ? 300000 : 15000)) return;
     const ops = [];
     let posOp = null;
-    if (Math.abs(t - this.lastPushT) >= 2) {
+    const movedOn = Math.abs(t - this.lastPushT) >= 2 || (opts.carried && opts.word !== this.lastPushW);
+    const wait = held && movedOn && !opts.carried && !(this.resumeFrom && this.resumeFrom.playing);
+    if (wait) this.owedPos = true;
+    else if (movedOn) {
       // stamped later than the place it replaces, even if this device's clock is a little behind
-      const stamp = Math.max(now, ((this.state && this.state.position && this.state.position.updated) || 0) + 1);
+      const stamp = opts.stamp != null ? opts.stamp
+        : held ? Math.max((store.get('pos:' + S.meta.id) || {}).moved || now, this.lastMoveAt + 1)
+          : Math.max(now, ((this.state && this.state.position && this.state.position.updated) || 0) + 1);
       posOp = { op: 'position', v: 2, from: myId, time: t, cfi: S.loc && S.loc.start ? S.loc.start.cfi : null, dur: audio.duration || null,
         chapter: currentChapter(t).title || null, device: deviceName(), updated: stamp };
-      this.lastPushT = t; this.lastMoveAt = stamp; this.pendingOffer = null;
+      this.lastPushT = t; this.lastPushW = opts.carried ? opts.word : null;
+      this.lastMoveAt = Math.max(this.lastMoveAt, stamp);
+      if (!(this.pendingOffer && stamp < this.pendingOffer.at)) this.pendingOffer = null;   // (an older place doesn't answer it)
     } else if (this.unsent) posOp = this.unsent;   // keeps its own time stamp, so it never beats newer news
     if (posOp) ops.push(posOp);
     const secs = this.listenAcc >= 1 ? Math.round(this.listenAcc) : 0;
     const listenOps = [...this.unsentListen];
     if (secs) { listenOps.push({ op: 'listened', id: uid(), date: today(), seconds: secs }); this.listenAcc = 0; }
     ops.push(...listenOps);
-    if (!ops.length) return;
-    if (force && audio.paused) ops.push({ op: 'flush' });     // a reading session ended (pause, close, leave): sync it now
+    // a reading session ended (pause, close, leave, the window closes): sync it now, also when what it changed
+    // was already sent (e.g. a place reached by reading on, sent by the regular save)
+    const ending = force && (audio.paused || !!opts.end);
+    if (!ops.length && !(ending && this.flushOwed)) return;
+    if (ending) ops.push({ op: 'flush' });
+    this.flushOwed = !ending;
     this.lastPushAt = now;
     const book = S.meta.id;
     this.send(ops).then((r) => {
@@ -102,18 +130,19 @@ const Shared = {
         return;
       }
       if (!S.meta || S.meta.id !== book) return;           // another book by now
+      if (ending) this.flushOwed = true;                   // (still owed: asked for again at the next session end)
       if (posOp && (!this.unsent || (this.unsent.updated || 0) <= posOp.updated)) this.unsent = posOp;
       for (const x of listenOps) if (!this.unsentListen.includes(x)) this.unsentListen.push(x);
     });
   },
   // another device (or window) got further while this one sat paused: offer to go there (never jump by itself).
-  // afterPull: the newest progress arrived late (slow connection at open): also while playing, against the
-  // place the book was opened with
-  checkAhead(afterPull) {
+  // afterPull: the newest progress arrived late (slow connection at open, or just back in the app): also while
+  // playing, against the place this device had then (base; at open: the place the book was opened with)
+  checkAhead(afterPull, base) {
     const r = this.state && this.state.position;
     if (!r || !S.book || (!audio.paused && !afterPull) || !r.device || fromHere(r) || r.time == null) return;
     const at = r.updated || 0;
-    const mine = afterPull ? Math.max(this.openedWith || 0, 0) : this.lastMoveAt;
+    const mine = afterPull ? Math.max(base != null ? base : (this.openedWith || 0), 0) : this.lastMoveAt;
     if (at <= mine + 1000 || at <= this.offeredAt || Math.abs(r.time - audio.currentTime) < 30) return;
     this.offeredAt = at;
     this.pendingOffer = { r, at };
@@ -126,7 +155,17 @@ const Shared = {
     const ch = chapterLabel(currentChapter(r.time).title || '');
     const what = r.time > audio.currentTime ? 'You got further on' : r.time < 5 ? 'You started over on' : 'You went back to an earlier place on';
     toast(`${what} ${r.device}${ch ? ` (${ch})` : ''}.`, 15000, {
-      label: 'Go there', run: () => { audio.currentTime = r.time; setFollow(true); this.lastPushT = r.time; this.lastMoveAt = at; this.pendingOffer = null; },
+      label: 'Go there',
+      run: () => {
+        // if this device already sent its own place over the offered one, send the offered one again as the newest
+        // (otherwise the other devices would keep this device's older place)
+        const over = this.lastMoveAt > at;
+        audio.currentTime = r.time; setFollow(true);
+        this.lastPushT = over ? -Infinity : r.time;
+        if (!over) this.lastMoveAt = at;
+        this.pendingOffer = null;
+        if (over) savePos();
+      },
     });
   },
   // pressing play while an offer was missed: show it once more before this device's place takes over
@@ -539,4 +578,33 @@ Shared.refresh = async function () {
   const before = JSON.stringify([Shared.state && Shared.state.highlights, Shared.state && Shared.state.bookmarks]);
   await Shared.load(S.meta.id);
   Shared.afterLoad(before);
+};
+// back to the app after a while: other devices may have moved on meanwhile. Until their news is in, this device's
+// place isn't sent (and reading on doesn't move it), so a newer place is offered, never overwritten
+Shared.resume = async function () {
+  const book = S.meta && S.meta.id;
+  if (!book || !S.book) return;
+  const my = (this.resumeSeq = (this.resumeSeq || 0) + 1);
+  const base = this.lastMoveAt;                           // this device's place when it came back
+  this.resumeFrom = { playing: !audio.paused };           // (still listening in the background: an ongoing session)
+  this.resuming = true;
+  const done = () => { if (this.resumeSeq === my) this.resuming = false; };
+  const timer = setTimeout(done, 15000);                  // never hold back for long
+  try {
+    await this.refresh();
+    const same = () => S.meta && S.meta.id === book;
+    if (this.state && this.state.syncPending && same()) {    // the PC is still asking GitHub
+      await new Promise((res) => setTimeout(res, 4000));
+      await this.refresh();
+    } else if (OFFLINE && PhoneSync.pulls[book] && same()) { // the phone is still asking GitHub
+      await PhoneSync.pulls[book];
+      if (same()) await this.refresh();
+    }
+  } catch { /* offline: nothing newer to know */ } finally { clearTimeout(timer); done(); }
+  // newer progress from another device: offered also if this device started playing meanwhile; then the place held
+  // back meanwhile is sent (as new: 'Go there' still wins the offered one back)
+  if (this.resumeSeq === my && S.meta && S.meta.id === book) {
+    this.checkAhead(true, base);
+    if (this.owedPos && S.book) { this.owedPos = false; savePos(); }
+  }
 };

@@ -1,1 +1,1 @@
-window.READALONG_BUILD = '556617223a';
+window.READALONG_BUILD = '1ad5e33e70';
